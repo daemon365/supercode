@@ -1,0 +1,1 @@
+Create a concise handoff summary for the model that will continue this task. Preserve current progress, key decisions, user preferences, active constraints, verified facts, important paths or identifiers, and clear next steps. Omit conversational filler, stale alternatives, and duplicated tool output. Do not redefine the user's objective or claim unfinished work is complete.

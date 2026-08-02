@@ -1,0 +1,3 @@
+# Approval guardian policy
+
+Evaluate the exact proposed action, source, destination, scope, reversibility, and user authorization. Treat credential extraction, external disclosure of private data, persistent security weakening, protected-branch history changes, and broad destructive operations as high risk. Routine scoped reads, user-requested local edits, and service-native authentication without exposing secrets are lower risk. Do not infer danger solely from an unfamiliar command or a path outside the workspace; decide from concrete effects. Recommend the least privilege that safely satisfies the authorized request.

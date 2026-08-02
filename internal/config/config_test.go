@@ -1,0 +1,147 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestEnsureCreatesSecureConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".supercode", "config.yaml")
+	created, err := Ensure(path)
+	if err != nil {
+		t.Fatalf("Ensure() error: %v", err)
+	}
+	if !created {
+		t.Fatal("Ensure() created = false, want true")
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if !strings.Contains(string(contents), "token: \"\"") {
+		t.Fatalf("starter config does not contain an empty token: %s", contents)
+	}
+	if !strings.Contains(string(contents), "memory_generate: false") || !strings.Contains(string(contents), "memory_use: true") {
+		t.Fatalf("starter config does not document file-backed memory: %s", contents)
+	}
+
+	if runtime.GOOS != "windows" {
+		directoryInfo, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatalf("stat config directory: %v", err)
+		}
+		if got := directoryInfo.Mode().Perm(); got != 0o700 {
+			t.Fatalf("config directory mode = %o, want 700", got)
+		}
+		fileInfo, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat config file: %v", err)
+		}
+		if got := fileInfo.Mode().Perm(); got != 0o600 {
+			t.Fatalf("config file mode = %o, want 600", got)
+		}
+	}
+}
+
+func TestEnsureDoesNotOverwriteExistingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("model: custom\n"), 0o644); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	created, err := Ensure(path)
+	if err != nil {
+		t.Fatalf("Ensure() error: %v", err)
+	}
+	if created {
+		t.Fatal("Ensure() created = true, want false")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if string(contents) != "model: custom\n" {
+		t.Fatalf("config was overwritten: %q", contents)
+	}
+}
+
+func TestLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "url: http://127.0.0.1:8000/v1\nmodel: local\ntoken: secret\nstream: false\ntimeout: 30s\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if loaded.URL != "http://127.0.0.1:8000/v1" || loaded.Model != "local" || loaded.Token != "secret" {
+		t.Fatalf("Load() = %#v", loaded)
+	}
+	if loaded.Stream == nil || *loaded.Stream {
+		t.Fatalf("Load().Stream = %v, want false", loaded.Stream)
+	}
+	if loaded.Timeout != "30s" {
+		t.Fatalf("Load().Timeout = %q, want 30s", loaded.Timeout)
+	}
+}
+
+func TestLoadRejectsUnknownFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("modle: typo\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want unknown field error")
+	}
+}
+
+func TestMergeProjectConfiguration(t *testing.T) {
+	stream := false
+	base := File{
+		Model: "base", Instructions: "user instructions", TrustedWorkspaces: []string{"/trusted"},
+		MCPServers: map[string]MCPServer{"user": {Command: "user-server"}},
+	}
+	overlay := File{
+		Model: "project", Instructions: "project instructions", Stream: &stream,
+		MCPServers:        map[string]MCPServer{"project": {Command: "project-server"}},
+		TrustedWorkspaces: []string{"/must-not-be-inherited"},
+	}
+	merged := Merge(base, overlay)
+	if merged.Model != "project" || merged.Stream == nil || *merged.Stream {
+		t.Fatalf("merged settings = %#v", merged)
+	}
+	if !strings.Contains(merged.Instructions, "user instructions") || !strings.Contains(merged.Instructions, "project instructions") {
+		t.Fatalf("merged instructions = %q", merged.Instructions)
+	}
+	if len(merged.MCPServers) != 2 {
+		t.Fatalf("MCP servers = %#v", merged.MCPServers)
+	}
+	if len(merged.TrustedWorkspaces) != 1 || merged.TrustedWorkspaces[0] != "/trusted" {
+		t.Fatalf("project modified trust roots: %#v", merged.TrustedWorkspaces)
+	}
+}
+
+func TestTrustWorkspacePersistsCanonicalPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("config_version: 1\nmodel: test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	if err := TrustWorkspace(path, workspace); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsWorkspaceTrusted(loaded, workspace) {
+		t.Fatalf("workspace was not trusted: %#v", loaded.TrustedWorkspaces)
+	}
+}
