@@ -1,15 +1,22 @@
 package app
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/daemon365/supercode/internal/attachment"
 	"github.com/daemon365/supercode/internal/config"
 	"github.com/daemon365/supercode/internal/provider"
+)
+
+const (
+	maxInitialImages     = 8
+	maxInitialImageBytes = int64(64 * 1024 * 1024)
 )
 
 type startupState struct {
@@ -63,6 +70,9 @@ func prepareStartup(args []string, stdout, stderr io.Writer, lookupEnv func(stri
 	if !workspaceInfo.IsDir() {
 		return startupState{}, false, errors.New("workspace must be a directory")
 	}
+	if len(options.imagePaths) > maxInitialImages {
+		return startupState{}, false, fmt.Errorf("initial images exceed the %d-image limit", maxInitialImages)
+	}
 	initialImages := make([]provider.Image, 0, len(options.imagePaths))
 	for _, path := range options.imagePaths {
 		image, loadErr := attachment.Load(path, "high")
@@ -70,6 +80,9 @@ func prepareStartup(args []string, stdout, stderr io.Writer, lookupEnv func(stri
 			return startupState{}, false, fmt.Errorf("load image %s: %w", path, loadErr)
 		}
 		initialImages = append(initialImages, image)
+	}
+	if err := validateInitialImages(initialImages, maxInitialImages, maxInitialImageBytes); err != nil {
+		return startupState{}, false, err
 	}
 	if options.trustProject {
 		if err := config.TrustWorkspace(configPath, options.workspace); err != nil {
@@ -109,4 +122,26 @@ func prepareStartup(args []string, stdout, stderr io.Writer, lookupEnv func(stri
 		projectConfigPath: projectConfigPath, projectConfigStatus: projectConfigStatus,
 		options: options, promptArgs: promptArgs, initialImages: initialImages,
 	}, false, nil
+}
+
+func validateInitialImages(images []provider.Image, countLimit int, byteLimit int64) error {
+	if len(images) > countLimit {
+		return fmt.Errorf("initial images exceed the %d-image limit", countLimit)
+	}
+	var total int64
+	for _, image := range images {
+		decoded := int64(base64.StdEncoding.DecodedLen(len(image.Data)))
+		if strings.HasSuffix(image.Data, "=") {
+			decoded--
+		}
+		if strings.HasSuffix(image.Data, "==") {
+			decoded--
+		}
+		decoded = max(0, decoded)
+		if decoded > byteLimit-total {
+			return fmt.Errorf("initial images exceed the aggregate %d MiB limit", byteLimit/(1024*1024))
+		}
+		total += decoded
+	}
+	return nil
 }

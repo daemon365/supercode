@@ -7,15 +7,21 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/daemon365/supercode/internal/agent"
 	"github.com/daemon365/supercode/internal/collaboration"
 	"github.com/daemon365/supercode/internal/config"
+	"github.com/daemon365/supercode/internal/credential"
 	"github.com/daemon365/supercode/internal/mcp"
 	"github.com/daemon365/supercode/internal/permission"
 	"github.com/daemon365/supercode/internal/policy"
+	"github.com/daemon365/supercode/internal/provider"
+	anthropicProvider "github.com/daemon365/supercode/internal/provider/anthropic"
 	openaiProvider "github.com/daemon365/supercode/internal/provider/openai"
+	openaiResponsesProvider "github.com/daemon365/supercode/internal/provider/openairesponses"
+	openrouterProvider "github.com/daemon365/supercode/internal/provider/openrouter"
 	"github.com/daemon365/supercode/internal/session"
 	"github.com/daemon365/supercode/internal/taskstate"
 	"github.com/daemon365/supercode/internal/tool"
@@ -27,7 +33,7 @@ type agentRuntime struct {
 	permissions   *permission.Manager
 	sandboxStatus string
 	mcpNames      []string
-	provider      *openaiProvider.Provider
+	provider      provider.Provider
 	tools         *tool.Registry
 	runner        *agent.Runner
 	taskState     *taskstate.State
@@ -35,9 +41,19 @@ type agentRuntime struct {
 	terminalInput bool
 	userInput     *userinput.Manager
 	mcp           *mcp.Manager
+	mcpWarnings   []string
+	builtins      io.Closer
 }
 
 func (r agentRuntime) close() {
+	if r.collaboration != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_ = r.collaboration.Shutdown(ctx)
+		cancel()
+	}
+	if r.builtins != nil {
+		_ = r.builtins.Close()
+	}
 	if r.mcp != nil {
 		_ = r.mcp.Close()
 	}
@@ -107,11 +123,16 @@ func assembleAgentRuntime(
 		ReadRoots: readRoots, WriteRoots: fileConfig.WriteRoots,
 		DenyRoots: fileConfig.DenyRoots, Permissions: permissionManager,
 	}
-	builtins, err := tool.BuiltinsWithOptions(options.workspace, sandboxOptions)
+	builtins, builtinLifecycle, err := tool.BuiltinsWithLifecycle(options.workspace, sandboxOptions)
 	if err != nil {
 		return agentRuntime{}, err
 	}
-	mcpConfigurations, mcpNames := mcpConfigs(fileConfig)
+	defer func() {
+		if returnErr != nil {
+			_ = builtinLifecycle.Close()
+		}
+	}()
+	mcpConfigurations, _ := mcpConfigs(fileConfig)
 	mcpManager, err := mcp.ConnectAll(ctx, options.workspace, mcpConfigurations)
 	if err != nil {
 		return agentRuntime{}, err
@@ -124,22 +145,22 @@ func assembleAgentRuntime(
 	baseTools := append([]tool.Tool(nil), builtins...)
 	baseTools = append(baseTools, stores.memory.Tools()...)
 	baseTools = append(baseTools, mcpManager.Tools()...)
-	apiKey, err := resolveAPIKey(ctx, fileConfig, lookupEnv)
+	mcpWarnings := make([]string, 0, len(mcpManager.Failures()))
+	for _, failure := range mcpManager.Failures() {
+		mcpWarnings = append(mcpWarnings, failure.Error())
+	}
+	modelProvider, err := buildModelProvider(ctx, fileConfig, options, lookupEnv)
 	if err != nil {
 		return agentRuntime{}, err
 	}
-	openAI, err := openaiProvider.New(openaiProvider.Config{APIKey: apiKey, BaseURL: options.baseURL, MaxRetries: options.maxRetries})
-	if err != nil {
-		return agentRuntime{}, err
-	}
-	stores.memory.StartStartup(ctx, openAI, stores.sessions, activeSession.ID, options.modelName)
+	stores.memory.StartStartup(ctx, modelProvider, stores.sessions, activeSession.ID, options.modelName)
 	baseRegistry, err := tool.NewRegistry(baseTools...)
 	if err != nil {
 		return agentRuntime{}, err
 	}
 	subOptions := agentOptions(environment, stores, policyStore, eventLogger, permissionManager)
 	subOptions.Approval = agent.ApprovalNever
-	subRunner, err := agent.New(openAI, baseRegistry, subOptions)
+	subRunner, err := agent.New(modelProvider, baseRegistry, subOptions)
 	if err != nil {
 		return agentRuntime{}, err
 	}
@@ -170,16 +191,91 @@ func assembleAgentRuntime(
 	mainOptions := agentOptions(environment, stores, policyStore, eventLogger, permissionManager)
 	mainOptions.Approval = options.approval
 	mainOptions.OnUsage = taskState.RecordUsage
-	runner, err := agent.New(openAI, registry, mainOptions)
+	runner, err := agent.New(modelProvider, registry, mainOptions)
 	if err != nil {
 		return agentRuntime{}, err
 	}
 	return agentRuntime{
 		session: activeSession, permissions: permissionManager,
-		sandboxStatus: tool.SandboxStatusWithOptions(options.workspace, sandboxOptions), mcpNames: mcpNames,
-		provider: openAI, tools: registry, runner: runner, taskState: taskState,
-		collaboration: collaborationManager, terminalInput: terminalInput, userInput: userInputManager, mcp: mcpManager,
+		sandboxStatus: tool.SandboxStatusWithOptions(options.workspace, sandboxOptions), mcpNames: mcpManager.Names(),
+		provider: modelProvider, tools: registry, runner: runner, taskState: taskState,
+		collaboration: collaborationManager, terminalInput: terminalInput, userInput: userInputManager, mcp: mcpManager, mcpWarnings: mcpWarnings, builtins: builtinLifecycle,
 	}, nil
+}
+
+func buildModelProvider(ctx context.Context, fileConfig config.File, options options, lookupEnv func(string) (string, bool)) (provider.Provider, error) {
+	if len(fileConfig.Providers) == 0 {
+		apiKey, err := resolveAPIKey(ctx, fileConfig, lookupEnv)
+		if err != nil {
+			return nil, err
+		}
+		return openaiProvider.New(openaiProvider.Config{APIKey: apiKey, BaseURL: options.baseURL, MaxRetries: options.maxRetries})
+	}
+
+	routes := make([]provider.Route, 0, len(fileConfig.Providers))
+	for _, configuration := range fileConfig.Providers {
+		apiKey, err := resolveProviderAPIKey(ctx, configuration, lookupEnv)
+		if err != nil {
+			return nil, fmt.Errorf("provider %s: %w", configuration.Name, err)
+		}
+		kind := strings.ToLower(strings.TrimSpace(configuration.Provider))
+		var implementation provider.Provider
+		switch kind {
+		case "openai":
+			implementation, err = openaiProvider.New(openaiProvider.Config{
+				APIKey: apiKey, BaseURL: firstNonEmpty(configuration.URL, config.DefaultURL),
+				MaxRetries: options.maxRetries, Headers: configuration.Headers,
+			})
+		case "openai_responses":
+			implementation, err = openaiResponsesProvider.New(openaiResponsesProvider.Config{
+				APIKey: apiKey, BaseURL: firstNonEmpty(configuration.URL, config.DefaultURL),
+				MaxRetries: options.maxRetries, Headers: configuration.Headers,
+			})
+		case "anthropic":
+			implementation, err = anthropicProvider.New(anthropicProvider.Config{
+				APIKey: apiKey, BaseURL: configuration.URL, MaxRetries: options.maxRetries,
+				MaxTokens: configuration.MaxTokens, Headers: configuration.Headers,
+			})
+		case "openrouter":
+			implementation, err = openrouterProvider.New(openrouterProvider.Config{
+				APIKey: apiKey, BaseURL: configuration.URL, Headers: configuration.Headers,
+			})
+		default:
+			err = fmt.Errorf("unsupported provider type %q", configuration.Provider)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("provider %s: %w", configuration.Name, err)
+		}
+		routes = append(routes, provider.Route{Name: configuration.Name, Models: configuration.Models, Provider: implementation})
+	}
+	return provider.NewRouter(routes)
+}
+
+func resolveProviderAPIKey(ctx context.Context, configuration config.ProviderConfig, lookupEnv func(string) (string, bool)) (string, error) {
+	configured := strings.TrimSpace(configuration.Token)
+	if strings.HasPrefix(configured, "${") && strings.HasSuffix(configured, "}") && strings.Count(configured, "${") == 1 {
+		name := strings.TrimSpace(configured[2 : len(configured)-1])
+		if name == "" {
+			return "", errors.New("token environment variable name is empty")
+		}
+		if value, ok := lookupEnv(name); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value), nil
+		}
+		return "", fmt.Errorf("environment variable %s is required", name)
+	}
+	environmentName := "OPENAI_API_KEY"
+	switch strings.ToLower(strings.TrimSpace(configuration.Provider)) {
+	case "anthropic":
+		environmentName = "ANTHROPIC_API_KEY"
+	case "openrouter":
+		environmentName = "OPENROUTER_API_KEY"
+	}
+	if value, ok := lookupEnv(environmentName); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value), nil
+	}
+	command := configuration.TokenCommand
+	resolver := credential.Resolver{LookupEnv: func(string) (string, bool) { return "", false }}
+	return resolver.Resolve(ctx, credential.Source{Token: configured, Command: command})
 }
 
 func agentOptions(

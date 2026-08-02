@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -174,7 +175,59 @@ func preview(value string, maximum int) string {
 }
 
 func nextAgentEvent(events <-chan agent.Event) tea.Cmd {
-	return func() tea.Msg { event, ok := <-events; return agentEventMsg{events: events, event: event, ok: ok} }
+	return func() tea.Msg {
+		event, ok := <-events
+		message := agentEventMsg{events: events, event: event, ok: ok}
+		if !ok || event.Type != agent.EventTextDelta && event.Type != agent.EventToolOutputDelta {
+			return message
+		}
+
+		// Model providers often emit one event per token. Re-rendering Glamour
+		// and rebuilding the whole transcript for each token is quadratic for a
+		// long response, so collect a short burst while keeping UI latency low.
+		timer := time.NewTimer(20 * time.Millisecond)
+		defer timer.Stop()
+		var combined strings.Builder
+		combined.WriteString(event.Delta)
+		for {
+			select {
+			case next, open := <-events:
+				if !open {
+					message.event.Delta = combined.String()
+					return message
+				}
+				if !sameAgentDeltaStream(event, next) {
+					message.event.Delta = combined.String()
+					message.trailing = &next
+					return message
+				}
+				combined.WriteString(next.Delta)
+				if combined.Len() >= 64*1024 {
+					message.event.Delta = combined.String()
+					return message
+				}
+			case <-timer.C:
+				message.event.Delta = combined.String()
+				return message
+			}
+		}
+	}
+}
+
+func sameAgentDeltaStream(first, next agent.Event) bool {
+	if first.Type != next.Type {
+		return false
+	}
+	if first.Type == agent.EventTextDelta {
+		return true
+	}
+	if first.Type != agent.EventToolOutputDelta || first.SessionID != next.SessionID {
+		return false
+	}
+	if first.Call == nil || next.Call == nil {
+		return first.Call == nil && next.Call == nil
+	}
+	return first.Call.ID == next.Call.ID
 }
 
 func shortID(id string) string {

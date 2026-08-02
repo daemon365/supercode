@@ -21,7 +21,10 @@ func newEventLogger(options options) (func(agent.Event), error) {
 	}
 	logger.Log("startup", map[string]any{"workspace": options.workspace, "model": options.modelName, "version": "0.1.0"})
 	return func(event agent.Event) {
-		fields := map[string]any{"type": event.Type, "risk": event.Risk, "summary": event.Summary, "delta_bytes": len(event.Delta)}
+		fields := map[string]any{
+			"type": event.Type, "risk": event.Risk, "category": event.Category,
+			"summary_bytes": len(event.Summary), "delta_bytes": len(event.Delta),
+		}
 		if event.Call != nil {
 			fields["tool"] = event.Call.Name
 		}
@@ -29,7 +32,7 @@ func newEventLogger(options options) (func(agent.Event), error) {
 			fields["result_bytes"], fields["result_error"] = len(event.Result.Content), event.Result.IsError
 		}
 		if event.Err != nil {
-			fields["error"] = event.Err.Error()
+			fields["failed"] = true
 		}
 		logger.Log("agent_event", fields)
 	}, nil

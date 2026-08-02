@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/daemon365/supercode/internal/modelcatalog"
+	"github.com/daemon365/supercode/internal/permission"
 	"github.com/daemon365/supercode/internal/provider"
 	"github.com/daemon365/supercode/internal/tool"
 )
@@ -44,6 +48,50 @@ func TestRunnerFallsBackBeforeAnyStreamedOutput(t *testing.T) {
 	}
 	if len(model.requests) != 2 || model.requests[0].Model != "primary" || model.requests[1].Model != "fallback" {
 		t.Fatalf("requests = %#v", model.requests)
+	}
+}
+
+func TestRunnerAdaptsRequestToFallbackCapabilities(t *testing.T) {
+	toolCalling, noToolCalling := true, false
+	catalog := modelcatalog.New(nil, map[string]modelcatalog.Capabilities{
+		"primary":  {ToolCalling: &toolCalling},
+		"fallback": {ToolCalling: &noToolCalling, InputModalities: []string{"text"}},
+	})
+	model := &fakeProvider{responses: []provider.Response{{Text: "fallback worked"}}, errors: []error{errors.New("primary unavailable"), nil}}
+	registry, _ := tool.NewRegistry(&fakeTool{name: "read", risk: tool.RiskRead})
+	runner, err := New(model, registry, Options{Model: "primary", FallbackModels: []string{"fallback"}, Approval: ApprovalNever, ModelCatalog: catalog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range runner.Run(context.Background(), Input{Prompt: "hello"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if len(model.requests) != 2 || len(model.requests[0].Tools) == 0 || len(model.requests[1].Tools) != 0 || model.requests[1].ParallelToolCalls != nil {
+		t.Fatalf("capability-adapted requests = %#v", model.requests)
+	}
+}
+
+func TestRunnerSkipsFallbackWithoutRequiredImageModality(t *testing.T) {
+	model := &fakeProvider{errors: []error{errors.New("primary unavailable")}}
+	catalog := modelcatalog.New(nil, map[string]modelcatalog.Capabilities{
+		"primary":  {InputModalities: []string{"text", "image"}},
+		"fallback": {InputModalities: []string{"text"}},
+	})
+	registry, _ := tool.NewRegistry()
+	runner, err := New(model, registry, Options{Model: "primary", FallbackModels: []string{"fallback"}, Approval: ApprovalNever, ModelCatalog: catalog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	for event := range runner.Run(context.Background(), Input{Prompt: "inspect", Images: []provider.Image{{MIMEType: "image/png", Data: "AA=="}}}) {
+		if event.Type == EventError {
+			runErr = event.Err
+		}
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), "image input") || len(model.requests) != 1 {
+		t.Fatalf("error=%v requests=%d", runErr, len(model.requests))
 	}
 }
 
@@ -136,6 +184,19 @@ type fakeTool struct {
 	risk  tool.Risk
 }
 
+type categorizedFakeTool struct {
+	*fakeTool
+	category tool.Category
+}
+
+func (t *categorizedFakeTool) Category() tool.Category { return t.category }
+
+type emptyPermissionFakeTool struct{ fakeTool }
+
+func (*emptyPermissionFakeTool) PermissionRequest(string) (permission.Request, error) {
+	return permission.Request{}, nil
+}
+
 func (f *fakeTool) Definition() provider.ToolDefinition {
 	name := f.name
 	if name == "" {
@@ -153,6 +214,19 @@ func (*fakeTool) Summary(string) string { return "edit a file" }
 func (f *fakeTool) Execute(context.Context, string) (tool.Result, error) {
 	f.calls++
 	return tool.Result{Content: "edited"}, nil
+}
+
+func TestReturnedToolImagesHaveAggregateCountAndByteLimits(t *testing.T) {
+	images := []provider.Image{{MIMEType: "image/png", Data: "AA=="}, {MIMEType: "image/png", Data: "AA=="}}
+	if _, err := validateReturnedToolImages(images, maxReturnedToolImages-1, 0, maxReturnedToolImages, maxReturnedToolImageBytes); err == nil || !strings.Contains(err.Error(), "image limit") {
+		t.Fatalf("count-limit error = %v", err)
+	}
+	if _, err := validateReturnedToolImages(images[:1], 0, 0, maxReturnedToolImages, 0); err == nil || !strings.Contains(err.Error(), "decoded-data limit") {
+		t.Fatalf("byte-limit error = %v", err)
+	}
+	if added, err := validateReturnedToolImages(images, 0, 0, maxReturnedToolImages, maxReturnedToolImageBytes); err != nil || added != 2 {
+		t.Fatalf("valid images added=%d err=%v", added, err)
+	}
 }
 
 func TestRunnerExecutesApprovedToolAndContinues(t *testing.T) {
@@ -276,6 +350,91 @@ func TestRunnerAutoAllowsWorkspaceWriteWithoutApproval(t *testing.T) {
 	}
 }
 
+func TestRunnerGranularCategoryDenyPrecedesReadAutoApproval(t *testing.T) {
+	model := &fakeProvider{responses: []provider.Response{
+		{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "read", Arguments: `{}`}}},
+		{Text: "denied"},
+	}}
+	read := &categorizedFakeTool{fakeTool: &fakeTool{name: "read", risk: tool.RiskRead}, category: tool.CategoryFile}
+	registry, _ := tool.NewRegistry(read)
+	runner, _ := New(model, registry, Options{
+		Model: "test", Approval: ApprovalGranular,
+		ApprovalCategories: map[tool.Category]bool{tool.CategoryFile: false},
+	})
+	for event := range runner.Run(context.Background(), Input{Prompt: "read"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if read.calls != 0 {
+		t.Fatalf("read calls = %d, want denied", read.calls)
+	}
+}
+
+func TestRunnerSkipsEmptyPermissionGrantForLocalToolOperation(t *testing.T) {
+	model := &fakeProvider{responses: []provider.Response{
+		{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "local", Arguments: `{}`}}},
+		{Text: "done"},
+	}}
+	local := &emptyPermissionFakeTool{fakeTool{name: "local", risk: tool.RiskRead}}
+	registry, _ := tool.NewRegistry(local)
+	runner, _ := New(model, registry, Options{Model: "test", Approval: ApprovalNever})
+	for event := range runner.Run(context.Background(), Input{Prompt: "local operation"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if local.calls != 1 {
+		t.Fatalf("local calls = %d, want 1", local.calls)
+	}
+}
+
+func TestRootRunExpiresTurnPermissionsEvenInNeverMode(t *testing.T) {
+	manager, err := permission.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := t.TempDir()
+	if _, err := manager.Grant(permission.Profile{FileSystem: permission.FileSystem{Read: []string{extra}}}, permission.ScopeTurn); err != nil {
+		t.Fatal(err)
+	}
+	registry, _ := tool.NewRegistry()
+	runner, _ := New(&fakeProvider{responses: []provider.Response{{Text: "done"}}}, registry, Options{Model: "test", Approval: ApprovalNever, Permissions: manager})
+	for event := range runner.Run(context.Background(), Input{Prompt: "hello"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if snapshot := manager.Snapshot(); len(snapshot.Turn.FileSystem.Read) != 0 {
+		t.Fatalf("turn permission survived root turn start: %+v", snapshot)
+	}
+}
+
+func TestForkDoesNotExpireParentTurnPermissions(t *testing.T) {
+	manager, err := permission.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := t.TempDir()
+	if _, err := manager.Grant(permission.Profile{FileSystem: permission.FileSystem{Read: []string{extra}}}, permission.ScopeTurn); err != nil {
+		t.Fatal(err)
+	}
+	registry, _ := tool.NewRegistry()
+	parent, _ := New(&fakeProvider{responses: []provider.Response{{Text: "done"}}}, registry, Options{Model: "test", Approval: ApprovalNever, Permissions: manager})
+	child, err := parent.Fork("", ApprovalNever)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for event := range child.Run(context.Background(), Input{Prompt: "hello"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if snapshot := manager.Snapshot(); len(snapshot.Turn.FileSystem.Read) != 1 {
+		t.Fatalf("child expired parent turn permission: %+v", snapshot)
+	}
+}
+
 func TestRunnerSessionApprovalAllowsRepeatedTool(t *testing.T) {
 	model := &fakeProvider{responses: []provider.Response{
 		{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "exec_command", Arguments: `{"cmd":"go test ./..."}`}}},
@@ -345,6 +504,121 @@ type progressTool struct{}
 
 func (*progressTool) Definition() provider.ToolDefinition {
 	return provider.ToolDefinition{Name: "progress", Parameters: []byte(`{"type":"object"}`)}
+}
+
+type delayedParallelTool struct {
+	name     string
+	parallel bool
+	delay    time.Duration
+	active   *atomic.Int64
+	maximum  *atomic.Int64
+}
+
+func (t *delayedParallelTool) Definition() provider.ToolDefinition {
+	return provider.ToolDefinition{Name: t.name, Parameters: []byte(`{"type":"object"}`)}
+}
+func (*delayedParallelTool) Risk(string) tool.Risk      { return tool.RiskRead }
+func (t *delayedParallelTool) ParallelSafe(string) bool { return t.parallel }
+func (t *delayedParallelTool) Summary(string) string    { return "delayed " + t.name }
+func (t *delayedParallelTool) Execute(context.Context, string) (tool.Result, error) {
+	active := t.active.Add(1)
+	for {
+		maximum := t.maximum.Load()
+		if active <= maximum || t.maximum.CompareAndSwap(maximum, active) {
+			break
+		}
+	}
+	time.Sleep(t.delay)
+	t.active.Add(-1)
+	return tool.Result{Content: t.name}, nil
+}
+
+func TestRunnerExecutesOptedInReadBatchConcurrentlyAndKeepsResultOrder(t *testing.T) {
+	model := &fakeProvider{responses: []provider.Response{
+		{ToolCalls: []provider.ToolCall{{Name: "read_a", Arguments: `{}`}, {Name: "read_b", Arguments: `{}`}}},
+		{Text: "done"},
+	}}
+	var active, maximum atomic.Int64
+	first := &delayedParallelTool{name: "read_a", parallel: true, delay: 60 * time.Millisecond, active: &active, maximum: &maximum}
+	second := &delayedParallelTool{name: "read_b", parallel: true, delay: 60 * time.Millisecond, active: &active, maximum: &maximum}
+	registry, _ := tool.NewRegistry(first, second)
+	runner, _ := New(model, registry, Options{Model: "test", Approval: ApprovalNever})
+	for event := range runner.Run(context.Background(), Input{Prompt: "read both"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if maximum.Load() < 2 {
+		t.Fatalf("maximum concurrency = %d, want at least 2", maximum.Load())
+	}
+	history := model.requests[1].History
+	if len(history) != 4 || history[2].Content != "read_a" || history[3].Content != "read_b" {
+		t.Fatalf("tool results lost response order: %+v", history)
+	}
+	if history[1].ToolCalls[0].ID == "" || history[1].ToolCalls[0].ID != history[2].ToolCallID {
+		t.Fatalf("generated tool call IDs are inconsistent: %+v", history)
+	}
+}
+
+func TestGeneratedToolCallIDsStayUniqueAcrossRuns(t *testing.T) {
+	model := &fakeProvider{responses: []provider.Response{
+		{ToolCalls: []provider.ToolCall{{Name: "read", Arguments: `{}`}}}, {Text: "first"},
+		{ToolCalls: []provider.ToolCall{{Name: "read", Arguments: `{}`}}}, {Text: "second"},
+	}}
+	read := &delayedParallelTool{name: "read", parallel: true, active: &atomic.Int64{}, maximum: &atomic.Int64{}}
+	registry, _ := tool.NewRegistry(read)
+	runner, _ := New(model, registry, Options{Model: "test", Approval: ApprovalNever})
+	var identifiers []string
+	for _, prompt := range []string{"one", "two"} {
+		for event := range runner.Run(context.Background(), Input{Prompt: prompt}) {
+			if event.Type == EventError {
+				t.Fatal(event.Err)
+			}
+			if event.Type == EventCompleted {
+				identifiers = append(identifiers, event.History[1].ToolCalls[0].ID)
+			}
+		}
+	}
+	if len(identifiers) != 2 || identifiers[0] == "" || identifiers[0] == identifiers[1] {
+		t.Fatalf("generated IDs = %v", identifiers)
+	}
+}
+
+func TestRunnerSerializesBatchWhenAnyToolDoesNotOptIn(t *testing.T) {
+	model := &fakeProvider{responses: []provider.Response{
+		{ToolCalls: []provider.ToolCall{{ID: "a", Name: "read_a", Arguments: `{}`}, {ID: "b", Name: "stateful", Arguments: `{}`}}},
+		{Text: "done"},
+	}}
+	var active, maximum atomic.Int64
+	first := &delayedParallelTool{name: "read_a", parallel: true, delay: 10 * time.Millisecond, active: &active, maximum: &maximum}
+	second := &delayedParallelTool{name: "stateful", parallel: false, delay: 10 * time.Millisecond, active: &active, maximum: &maximum}
+	registry, _ := tool.NewRegistry(first, second)
+	runner, _ := New(model, registry, Options{Model: "test", Approval: ApprovalNever})
+	for event := range runner.Run(context.Background(), Input{Prompt: "read safely"}) {
+		if event.Type == EventError {
+			t.Fatal(event.Err)
+		}
+	}
+	if maximum.Load() != 1 {
+		t.Fatalf("stateful read overlapped another call: maximum concurrency=%d", maximum.Load())
+	}
+}
+
+func TestParallelToolSlotAcquisitionHonorsCancellation(t *testing.T) {
+	var active, maximum atomic.Int64
+	item := &delayedParallelTool{name: "read", parallel: true, active: &active, maximum: &maximum}
+	registry, _ := tool.NewRegistry(item)
+	runner, _ := New(&fakeProvider{}, registry, Options{Model: "test", Approval: ApprovalNever})
+	runner.toolSlots = make(chan struct{}, 1)
+	runner.toolSlots <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := []preparedToolCall{{call: provider.ToolCall{Name: "read", Arguments: `{}`}, item: item}}
+	runner.executePreparedCalls(ctx, make(chan Event, 1), calls)
+	if !calls[0].finished || !calls[0].result.IsError || !strings.Contains(calls[0].result.Content, "canceled") || item.active.Load() != 0 {
+		t.Fatalf("canceled call = %+v active=%d", calls[0], item.active.Load())
+	}
+	<-runner.toolSlots
 }
 func (*progressTool) Risk(string) tool.Risk { return tool.RiskRead }
 func (*progressTool) Summary(string) string { return "stream progress" }

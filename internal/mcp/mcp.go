@@ -11,12 +11,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/daemon365/supercode/internal/provider"
 	"github.com/daemon365/supercode/internal/tool"
@@ -34,43 +38,152 @@ type Config struct {
 }
 
 type Manager struct {
-	sessions []*sdkmcp.ClientSession
-	tools    []tool.Tool
+	closers      []func() error
+	cancels      []context.CancelFunc
+	tools        []tool.Tool
+	names        []string
+	failures     []error
+	closeOnce    sync.Once
+	closeErr     error
+	closeTimeout time.Duration
 }
 
+const managerCloseTimeout = 5 * time.Second
+
+const (
+	maxMCPTextBytes = 256 * 1024
+	maxMCPBlobBytes = 192 * 1024
+	mcpTextMarker   = "\n[MCP text truncated]"
+)
+
 func ConnectAll(ctx context.Context, workspace string, configurations map[string]Config) (*Manager, error) {
+	return connectAllWith(ctx, workspace, configurations, 15*time.Second, discoverServer)
+}
+
+type discoveredServer struct {
+	name    string
+	session *sdkmcp.ClientSession
+	tools   []tool.Tool
+	cancel  context.CancelFunc
+	close   func() error
+}
+
+func (s discoveredServer) closer() func() error {
+	if s.close != nil {
+		return s.close
+	}
+	return func() error {
+		if s.session == nil {
+			return nil
+		}
+		return s.session.Close()
+	}
+}
+
+type serverDiscoverer func(context.Context, string, string, Config) (discoveredServer, error)
+
+func connectAllWith(ctx context.Context, workspace string, configurations map[string]Config, timeout time.Duration, discover serverDiscoverer) (*Manager, error) {
 	manager := &Manager{}
 	names := make([]string, 0, len(configurations))
 	for name := range configurations {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	for _, name := range names {
-		session, err := connect(ctx, workspace, configurations[name])
-		if err != nil {
-			_ = manager.Close()
-			return nil, fmt.Errorf("connect MCP server %q: %w", name, err)
-		}
-		manager.sessions = append(manager.sessions, session)
-		for remote, err := range session.Tools(ctx, nil) {
-			if err != nil {
-				_ = manager.Close()
-				return nil, fmt.Errorf("list MCP tools from %q: %w", name, err)
+	type outcome struct {
+		server discoveredServer
+		err    error
+	}
+	outcomes := make([]outcome, len(names))
+	var group sync.WaitGroup
+	for index, name := range names {
+		group.Add(1)
+		go func(index int, name string) {
+			defer group.Done()
+			// A stdio transport is tied to its context for the full process
+			// lifetime, so a deadline context cannot be canceled after a
+			// successful handshake. Race discovery against a timer instead and
+			// cancel only failed/timed-out servers; the parent owns healthy ones.
+			serverContext, cancel := context.WithCancel(ctx)
+			result := make(chan outcome)
+			go func() {
+				server, err := discover(serverContext, workspace, name, configurations[name])
+				if err != nil && (server.session != nil || server.close != nil) {
+					_ = server.closer()()
+					server = discoveredServer{}
+				}
+				value := outcome{server: server, err: err}
+				select {
+				case result <- value:
+				case <-serverContext.Done():
+					if server.session != nil || server.close != nil {
+						_ = server.closer()()
+					}
+				}
+			}()
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case outcomes[index] = <-result:
+				if outcomes[index].err != nil {
+					cancel()
+				} else {
+					outcomes[index].server.cancel = cancel
+				}
+			case <-timer.C:
+				cancel()
+				outcomes[index].err = fmt.Errorf("startup exceeded %s", timeout)
+			case <-ctx.Done():
+				cancel()
+				outcomes[index].err = ctx.Err()
 			}
-			manager.tools = append(manager.tools, &remoteTool{server: name, session: session, remote: remote})
+		}(index, name)
+	}
+	group.Wait()
+	if ctx.Err() != nil {
+		for _, outcome := range outcomes {
+			if outcome.server.session != nil || outcome.server.close != nil {
+				_ = outcome.server.closer()()
+			}
 		}
-		initialized := session.InitializeResult()
-		if initialized == nil || initialized.Capabilities == nil {
+		return nil, ctx.Err()
+	}
+	for index, outcome := range outcomes {
+		if outcome.err != nil {
+			manager.failures = append(manager.failures, fmt.Errorf("MCP server %q: %w", names[index], outcome.err))
 			continue
 		}
-		if initialized.Capabilities.Resources != nil {
-			manager.tools = append(manager.tools, resourceTools(name, session)...)
-		}
-		if initialized.Capabilities.Prompts != nil {
-			manager.tools = append(manager.tools, promptTools(name, session)...)
-		}
+		manager.names = append(manager.names, outcome.server.name)
+		manager.closers = append(manager.closers, outcome.server.closer())
+		manager.cancels = append(manager.cancels, outcome.server.cancel)
+		manager.tools = append(manager.tools, outcome.server.tools...)
 	}
 	return manager, nil
+}
+
+func discoverServer(ctx context.Context, workspace, name string, configuration Config) (discoveredServer, error) {
+	session, err := connect(ctx, workspace, configuration)
+	if err != nil {
+		return discoveredServer{}, fmt.Errorf("connect: %w", err)
+	}
+	server := discoveredServer{name: name, session: session}
+	for remote, listErr := range session.Tools(ctx, nil) {
+		if listErr != nil {
+			_ = session.Close()
+			return discoveredServer{}, fmt.Errorf("list tools: %w", listErr)
+		}
+		server.tools = append(server.tools, &remoteTool{server: name, session: session, remote: remote})
+	}
+	initialized := session.InitializeResult()
+	if initialized == nil || initialized.Capabilities == nil {
+		return server, nil
+	}
+	if initialized.Capabilities.Resources != nil {
+		server.tools = append(server.tools, resourceTools(name, session)...)
+	}
+	if initialized.Capabilities.Prompts != nil {
+		server.tools = append(server.tools, promptTools(name, session)...)
+	}
+	return server, nil
 }
 
 func (m *Manager) Tools() []tool.Tool {
@@ -80,17 +193,74 @@ func (m *Manager) Tools() []tool.Tool {
 	return append([]tool.Tool(nil), m.tools...)
 }
 
+func (m *Manager) Names() []string {
+	if m == nil {
+		return nil
+	}
+	return append([]string(nil), m.names...)
+}
+
+func (m *Manager) Failures() []error {
+	if m == nil {
+		return nil
+	}
+	return append([]error(nil), m.failures...)
+}
+
 func (m *Manager) Close() error {
 	if m == nil {
 		return nil
 	}
-	var failures []error
-	for _, session := range m.sessions {
-		if err := session.Close(); err != nil {
-			failures = append(failures, err)
+	m.closeOnce.Do(func() {
+		for _, cancel := range m.cancels {
+			if cancel != nil {
+				cancel()
+			}
 		}
-	}
-	return errors.Join(failures...)
+		finished := make(chan error, 1)
+		go func() {
+			const closeWorkers = 4
+			jobs := make(chan func() error)
+			failures := make(chan error, len(m.closers))
+			var workers sync.WaitGroup
+			for index := 0; index < min(closeWorkers, len(m.closers)); index++ {
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					for closeSession := range jobs {
+						if closeSession != nil {
+							failures <- closeSession()
+						}
+					}
+				}()
+			}
+			for _, closeSession := range m.closers {
+				jobs <- closeSession
+			}
+			close(jobs)
+			workers.Wait()
+			close(failures)
+			var closeFailures []error
+			for err := range failures {
+				if err != nil {
+					closeFailures = append(closeFailures, err)
+				}
+			}
+			finished <- errors.Join(closeFailures...)
+		}()
+		timeout := m.closeTimeout
+		if timeout <= 0 {
+			timeout = managerCloseTimeout
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case m.closeErr = <-finished:
+		case <-timer.C:
+			m.closeErr = fmt.Errorf("timed out closing MCP sessions after %s", timeout)
+		}
+	})
+	return m.closeErr
 }
 
 func connect(ctx context.Context, workspace string, configuration Config) (*sdkmcp.ClientSession, error) {
@@ -109,6 +279,8 @@ func connect(ctx context.Context, workspace string, configuration Config) (*sdkm
 			return nil, errors.New("stdio MCP server command is required")
 		}
 		command := exec.CommandContext(ctx, configuration.Command, configuration.Args...)
+		configureCommandTree(command)
+		command.WaitDelay = time.Second
 		command.Dir = workspace
 		command.Env = os.Environ()
 		keys := make([]string, 0, len(configuration.Env))
@@ -125,6 +297,10 @@ func connect(ctx context.Context, workspace string, configuration Config) (*sdkm
 		if strings.TrimSpace(configuration.URL) == "" {
 			return nil, errors.New("HTTP MCP server URL is required")
 		}
+		endpoint, err := url.Parse(configuration.URL)
+		if err != nil || endpoint.Host == "" || !strings.EqualFold(endpoint.Scheme, "http") && !strings.EqualFold(endpoint.Scheme, "https") {
+			return nil, errors.New("HTTP MCP server URL must use http or https and include a host")
+		}
 		headers := make(map[string]string, len(configuration.Headers)+1)
 		for key, value := range configuration.Headers {
 			headers[key] = os.ExpandEnv(value)
@@ -138,9 +314,21 @@ func connect(ctx context.Context, workspace string, configuration Config) (*sdkm
 				headers["Authorization"] = "Bearer " + token
 			}
 		}
+		httpClient := &http.Client{
+			Transport: &headerTransport{base: http.DefaultTransport, headers: headers, origin: endpoint},
+			CheckRedirect: func(request *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return errors.New("MCP HTTP redirect limit exceeded")
+				}
+				if !sameMCPOrigin(endpoint, request.URL) {
+					return fmt.Errorf("MCP HTTP redirect changed origin from %s to %s", endpoint.Host, request.URL.Host)
+				}
+				return nil
+			},
+		}
 		transport = &sdkmcp.StreamableClientTransport{
 			Endpoint:             configuration.URL,
-			HTTPClient:           &http.Client{Transport: &headerTransport{base: http.DefaultTransport, headers: headers}},
+			HTTPClient:           httpClient,
 			DisableStandaloneSSE: true,
 		}
 	default:
@@ -153,15 +341,25 @@ func connect(ctx context.Context, workspace string, configuration Config) (*sdkm
 type headerTransport struct {
 	base    http.RoundTripper
 	headers map[string]string
+	origin  *url.URL
 }
 
 func (t *headerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	clone := request.Clone(request.Context())
 	clone.Header = request.Header.Clone()
-	for key, value := range t.headers {
-		clone.Header.Set(key, value)
+	for key := range t.headers {
+		clone.Header.Del(key)
+	}
+	if sameMCPOrigin(t.origin, request.URL) {
+		for key, value := range t.headers {
+			clone.Header.Set(key, value)
+		}
 	}
 	return t.base.RoundTrip(clone)
+}
+
+func sameMCPOrigin(left, right *url.URL) bool {
+	return left != nil && right != nil && strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
 }
 
 type remoteTool struct {
@@ -185,9 +383,6 @@ func (t *remoteTool) Definition() provider.ToolDefinition {
 }
 
 func (t *remoteTool) Risk(string) tool.Risk {
-	if t.remote.Annotations != nil && t.remote.Annotations.ReadOnlyHint {
-		return tool.RiskRead
-	}
 	return tool.RiskExecute
 }
 
@@ -210,38 +405,117 @@ func (t *remoteTool) Execute(ctx context.Context, arguments string) (tool.Result
 }
 
 func mapContent(items []sdkmcp.Content, structured any, isError bool) (tool.Result, error) {
-	var text []string
-	var images []provider.Image
+	const (
+		maxResultImages     = 8
+		maxResultImageBytes = 16 * 1024 * 1024
+	)
+	imageCount := 0
+	imageBytes := 0
+	for _, content := range items {
+		image, ok := content.(*sdkmcp.ImageContent)
+		if !ok {
+			continue
+		}
+		imageCount++
+		if imageCount > maxResultImages {
+			return tool.Result{}, fmt.Errorf("MCP result exceeds the %d-image limit", maxResultImages)
+		}
+		if len(image.Data) > maxResultImageBytes-imageBytes {
+			return tool.Result{}, fmt.Errorf("MCP result images exceed the %d MiB limit", maxResultImageBytes/(1024*1024))
+		}
+		imageBytes += len(image.Data)
+	}
+	text := newBoundedMCPText(maxMCPTextBytes)
+	images := make([]provider.Image, 0, imageCount)
 	for _, content := range items {
 		switch item := content.(type) {
 		case *sdkmcp.TextContent:
-			text = append(text, item.Text)
+			if !text.truncated {
+				text.appendSection(item.Text)
+			}
 		case *sdkmcp.ImageContent:
 			images = append(images, provider.Image{Data: base64.StdEncoding.EncodeToString(item.Data), MIMEType: item.MIMEType, Detail: "high"})
 		case *sdkmcp.EmbeddedResource:
-			if item.Resource != nil {
-				text = append(text, resourceContentText(item.Resource))
+			if item.Resource != nil && !text.truncated {
+				if err := appendResourceContent(text, item.Resource); err != nil {
+					return tool.Result{}, err
+				}
 			}
 		case *sdkmcp.ResourceLink:
-			text = append(text, strings.TrimSpace(item.Name+"\n"+item.URI+"\n"+item.Description))
+			if !text.truncated {
+				text.startSection()
+				text.append(strings.TrimSpace(item.Name))
+				text.append("\n")
+				text.append(strings.TrimSpace(item.URI))
+				text.append("\n")
+				text.append(strings.TrimSpace(item.Description))
+			}
 		default:
-			if encoded, err := content.MarshalJSON(); err == nil {
-				text = append(text, string(encoded))
+			if !text.truncated {
+				encoded, fits, err := boundedJSON(content, text.remaining())
+				if err == nil {
+					if !fits {
+						text.markTruncated()
+					} else {
+						text.appendSection(string(encoded))
+					}
+				}
 			}
 		}
 	}
-	if structured != nil && len(text) == 0 {
-		text = append(text, prettyJSON(structured))
+	if structured != nil && text.sections == 0 {
+		encoded, fits, err := boundedJSON(structured, text.remaining())
+		if err != nil {
+			return tool.Result{}, fmt.Errorf("encode MCP structured content: %w", err)
+		}
+		if !fits {
+			text.markTruncated()
+		} else {
+			text.appendSection(string(encoded))
+		}
 	}
-	return tool.Result{Content: strings.Join(text, "\n\n"), Images: images, IsError: isError}, nil
+	return tool.Result{Content: text.String(), Images: images, IsError: isError}, nil
 }
 
-func resourceContentText(content *sdkmcp.ResourceContents) string {
-	value := content.Text
-	if value == "" && len(content.Blob) > 0 {
-		value = base64.StdEncoding.EncodeToString(content.Blob)
+func appendResourceContent(output *boundedMCPText, content *sdkmcp.ResourceContents) error {
+	if content == nil {
+		return nil
 	}
-	return strings.TrimSpace(content.URI + "\n" + value)
+	text := strings.TrimSpace(content.Text)
+	if text == "" && len(content.Blob) > maxMCPBlobBytes {
+		return fmt.Errorf("MCP resource blob exceeds the %d KiB limit", maxMCPBlobBytes/1024)
+	}
+	uri := strings.TrimSpace(content.URI)
+	output.startSection()
+	output.append(uri)
+	if text != "" {
+		if uri != "" {
+			output.append("\n")
+		}
+		output.append(text)
+		return nil
+	}
+	if len(content.Blob) == 0 {
+		return nil
+	}
+	encodedBytes := base64.StdEncoding.EncodedLen(len(content.Blob))
+	separatorBytes := 0
+	if uri != "" {
+		separatorBytes = 1
+	}
+	if encodedBytes+separatorBytes > output.remaining() {
+		output.markTruncated()
+		return nil
+	}
+	if separatorBytes > 0 {
+		output.append("\n")
+	}
+	encoder := base64.NewEncoder(base64.StdEncoding, output)
+	_, err := encoder.Write(content.Blob)
+	if closeErr := encoder.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 type methodTool struct {
@@ -255,6 +529,7 @@ func (*methodTool) Category() tool.Category { return tool.CategoryMCP }
 
 func (t *methodTool) Definition() provider.ToolDefinition { return t.definition }
 func (t *methodTool) Risk(string) tool.Risk               { return t.risk }
+func (t *methodTool) ParallelSafe(string) bool            { return t.risk == tool.RiskRead }
 func (t *methodTool) Summary(arguments string) string {
 	return t.method + " " + compact(arguments, 180)
 }
@@ -295,11 +570,16 @@ func resourceTools(server string, session *sdkmcp.ClientSession) []tool.Tool {
 				if err != nil {
 					return tool.Result{}, err
 				}
-				values := make([]string, 0, len(result.Contents))
+				values := newBoundedMCPText(maxMCPTextBytes)
 				for _, content := range result.Contents {
-					values = append(values, resourceContentText(content))
+					if values.truncated {
+						break
+					}
+					if err := appendResourceContent(values, content); err != nil {
+						return tool.Result{}, err
+					}
 				}
-				return tool.Result{Content: strings.Join(values, "\n\n")}, nil
+				return tool.Result{Content: values.String()}, nil
 			},
 		},
 	}
@@ -361,12 +641,218 @@ func decodeArguments(arguments string, target any) error {
 	return nil
 }
 
+type boundedMCPText struct {
+	buffer    bytes.Buffer
+	limit     int
+	sections  int
+	truncated bool
+}
+
+func newBoundedMCPText(limit int) *boundedMCPText {
+	return &boundedMCPText{limit: limit}
+}
+
+func (b *boundedMCPText) remaining() int {
+	return max(0, b.limit-len(mcpTextMarker)-b.buffer.Len())
+}
+
+func (b *boundedMCPText) Write(value []byte) (int, error) {
+	original := len(value)
+	remaining := b.remaining()
+	if remaining > 0 {
+		_, _ = b.buffer.Write(value[:min(len(value), remaining)])
+	}
+	if original > remaining {
+		b.truncated = true
+	}
+	return original, nil
+}
+
+func (b *boundedMCPText) append(value string) {
+	_, _ = io.WriteString(b, value)
+}
+
+func (b *boundedMCPText) startSection() {
+	if b.truncated {
+		return
+	}
+	if b.sections > 0 {
+		b.append("\n\n")
+	}
+	b.sections++
+}
+
+func (b *boundedMCPText) appendSection(value string) {
+	b.startSection()
+	b.append(value)
+}
+
+func (b *boundedMCPText) markTruncated() { b.truncated = true }
+
+func (b *boundedMCPText) String() string {
+	value := b.buffer.String()
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	if b.truncated {
+		value += mcpTextMarker
+	}
+	return value
+}
+
 func prettyJSON(value any) string {
+	output := newBoundedMCPText(maxMCPTextBytes)
+	encoded, fits, err := boundedJSON(value, output.remaining())
+	if err != nil {
+		output.append("[unable to encode MCP response: ")
+		output.append(err.Error())
+		output.append("]")
+	} else if !fits {
+		output.markTruncated()
+	} else {
+		output.append(string(encoded))
+	}
+	return output.String()
+}
+
+func boundedJSON(value any, limit int) ([]byte, bool, error) {
+	remaining := int64(limit)
+	if !jsonValueFits(reflect.ValueOf(value), &remaining, 0) {
+		return nil, false, nil
+	}
 	encoded, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return fmt.Sprint(value)
+		return nil, false, err
 	}
-	return string(encoded)
+	if len(encoded) > limit {
+		return nil, false, nil
+	}
+	return encoded, true, nil
+}
+
+var rawMessageType = reflect.TypeOf(json.RawMessage{})
+
+func jsonValueFits(value reflect.Value, remaining *int64, depth int) bool {
+	if depth > 100 || *remaining < 0 {
+		return false
+	}
+	if !value.IsValid() {
+		return consumeJSONBytes(remaining, 4)
+	}
+	if value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return consumeJSONBytes(remaining, 4)
+		}
+		return jsonValueFits(value.Elem(), remaining, depth+1)
+	}
+	if value.Type() == rawMessageType {
+		return consumeJSONBytes(remaining, int64(value.Len()))
+	}
+	switch value.Kind() {
+	case reflect.Bool:
+		return consumeJSONBytes(remaining, 5)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return consumeJSONBytes(remaining, 32)
+	case reflect.String:
+		return consumeJSONString(remaining, value.String())
+	case reflect.Slice:
+		if value.IsNil() {
+			return consumeJSONBytes(remaining, 4)
+		}
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return consumeJSONBytes(remaining, int64(base64.StdEncoding.EncodedLen(value.Len())+2))
+		}
+		fallthrough
+	case reflect.Array:
+		if !consumeJSONBytes(remaining, 2) {
+			return false
+		}
+		for index := 0; index < value.Len(); index++ {
+			if !consumeJSONBytes(remaining, 2) || !jsonValueFits(value.Index(index), remaining, depth+1) {
+				return false
+			}
+		}
+		return true
+	case reflect.Map:
+		if value.IsNil() {
+			return consumeJSONBytes(remaining, 4)
+		}
+		if !consumeJSONBytes(remaining, 2) {
+			return false
+		}
+		iterator := value.MapRange()
+		for iterator.Next() {
+			key := iterator.Key()
+			if !consumeJSONBytes(remaining, 2) {
+				return false
+			}
+			if key.Kind() == reflect.String {
+				if !consumeJSONString(remaining, key.String()) {
+					return false
+				}
+			} else if !consumeJSONBytes(remaining, 64) {
+				return false
+			}
+			if !jsonValueFits(iterator.Value(), remaining, depth+1) {
+				return false
+			}
+		}
+		return true
+	case reflect.Struct:
+		if !consumeJSONBytes(remaining, 2) {
+			return false
+		}
+		typeInfo := value.Type()
+		for index := 0; index < value.NumField(); index++ {
+			fieldInfo := typeInfo.Field(index)
+			if fieldInfo.PkgPath != "" {
+				continue
+			}
+			name := strings.Split(fieldInfo.Tag.Get("json"), ",")[0]
+			if name == "-" {
+				continue
+			}
+			if name == "" {
+				name = fieldInfo.Name
+			}
+			if !consumeJSONBytes(remaining, 2) || !consumeJSONString(remaining, name) || !jsonValueFits(value.Field(index), remaining, depth+1) {
+				return false
+			}
+		}
+		return true
+	default:
+		return consumeJSONBytes(remaining, 64)
+	}
+}
+
+func consumeJSONString(remaining *int64, value string) bool {
+	if !consumeJSONBytes(remaining, 2) {
+		return false
+	}
+	for _, character := range value {
+		size := utf8.RuneLen(character)
+		if character < 0x20 || character == '\\' || character == '"' || character == '<' || character == '>' || character == '&' || character == '\u2028' || character == '\u2029' {
+			size = 6
+		}
+		if character == utf8.RuneError {
+			size = 6
+		}
+		if !consumeJSONBytes(remaining, int64(size)) {
+			return false
+		}
+	}
+	return true
+}
+
+func consumeJSONBytes(remaining *int64, amount int64) bool {
+	if amount < 0 || amount > *remaining {
+		*remaining = -1
+		return false
+	}
+	*remaining -= amount
+	return true
 }
 
 var invalidName = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
@@ -388,27 +874,65 @@ func compact(value string, limit int) string {
 }
 
 func credentialCommand(ctx context.Context, command []string) (string, error) {
+	return credentialCommandWithTimeout(ctx, command, 5*time.Second)
+}
+
+func credentialCommandWithTimeout(ctx context.Context, command []string, timeout time.Duration) (string, error) {
 	if len(command) == 0 || strings.TrimSpace(command[0]) == "" {
 		return "", errors.New("credential command is empty")
 	}
-	commandContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	commandContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	process := exec.CommandContext(commandContext, command[0], command[1:]...)
-	var stdout bytes.Buffer
+	configureCommandTree(process)
+	process.WaitDelay = time.Second
+	stdout := boundedCredentialOutput{limit: 64 * 1024}
+	stdout.onExceeded = func() {
+		cancel()
+		_ = terminateCommandTree(process)
+	}
 	process.Stdout = &stdout
 	process.Stderr = io.Discard
-	if err := process.Run(); err != nil {
+	runErr := process.Run()
+	cleanupCommandTree(process)
+	if stdout.exceeded {
+		return "", errors.New("credential command output is too large")
+	}
+	if runErr != nil {
 		if errors.Is(commandContext.Err(), context.DeadlineExceeded) {
 			return "", errors.New("credential command timed out")
 		}
-		return "", fmt.Errorf("credential command failed: %w", err)
-	}
-	if stdout.Len() > 64*1024 {
-		return "", errors.New("credential command output is too large")
+		return "", fmt.Errorf("credential command failed: %w", runErr)
 	}
 	token := strings.TrimSpace(stdout.String())
 	if token == "" {
 		return "", errors.New("credential command returned an empty token")
 	}
 	return token, nil
+}
+
+type boundedCredentialOutput struct {
+	buffer     bytes.Buffer
+	limit      int
+	exceeded   bool
+	onExceeded func()
+	exceedOnce sync.Once
+}
+
+func (b *boundedCredentialOutput) Len() int       { return b.buffer.Len() }
+func (b *boundedCredentialOutput) String() string { return b.buffer.String() }
+
+func (b *boundedCredentialOutput) Write(value []byte) (int, error) {
+	original := len(value)
+	remaining := b.limit - b.Len()
+	if remaining > 0 {
+		_, _ = b.buffer.Write(value[:min(len(value), remaining)])
+	}
+	if original > remaining {
+		b.exceeded = true
+		if b.onExceeded != nil {
+			b.exceedOnce.Do(b.onExceeded)
+		}
+	}
+	return original, nil
 }

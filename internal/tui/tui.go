@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +28,11 @@ import (
 	"github.com/daemon365/supercode/internal/taskstate"
 	"github.com/daemon365/supercode/internal/tool"
 	"github.com/daemon365/supercode/internal/userinput"
+)
+
+const (
+	maxDraftImages     = 8
+	maxDraftImageBytes = int64(64 * 1024 * 1024)
 )
 
 type Options struct {
@@ -58,6 +64,7 @@ type Options struct {
 	GoalAutoContinue    bool
 	AlternateScreen     bool
 	Models              []string
+	ModelInfos          []provider.ModelInfo
 	ReasoningEffort     string
 	ServiceTier         string
 	FallbackModels      []string
@@ -72,98 +79,198 @@ type Options struct {
 	Notification        string
 	TerminalTitle       string
 	OnEvent             func(agent.Event)
+	StartupWarnings     []string
 }
 
 type message struct {
-	role, content string
-	callID        string
-	copyContent   string
-	rendered      string
-	streaming     bool
-	baseContent   string
-	toolStarted   time.Time
-	toolRunning   bool
-	toolOutput    string
+	role, content  string
+	historyContent string
+	callID         string
+	copyContent    string
+	rendered       string
+	streaming      bool
+	baseContent    string
+	toolStarted    time.Time
+	toolRunning    bool
+	toolOutput     string
+	streamChunks   []string
+	streamTail     string
+	streamBytes    int
 }
 
 type model struct {
-	ctx                  context.Context
-	runner               *agent.Runner
-	options              Options
-	input                textarea.Model
-	viewport             viewport.Model
-	spinner              spinner.Model
-	initialFocus         tea.Cmd
-	messages             []message
-	width, height        int
-	busy                 bool
-	history              []provider.Message
-	cancelCurrentRequest context.CancelFunc
-	initialPrompt        string
-	initialPromptFired   bool
-	agentEvents          <-chan agent.Event
-	activeRun            *agent.RunHandle
-	queuedMessages       []string
-	pendingApproval      *agent.ApprovalRequest
-	approvalChoice       int
-	store                *session.Store
-	session              session.Session
-	skills               *skill.Catalog
-	memory               *memory.Store
-	taskState            *taskstate.State
-	showPlan             bool
-	planMode             bool
-	collaborationMode    prompts.Mode
-	rawMode              bool
-	showRawTranscript    bool
-	showHelp             bool
-	commandMenuDismissed bool
-	commandChoice        int
-	showSessionPicker    bool
-	showModelPicker      bool
-	modelQuery           string
-	modelChoices         []string
-	modelChoice          int
-	showSkillPicker      bool
-	skillQuery           string
-	skillChoices         []skill.Skill
-	skillChoice          int
-	sessionQuery         string
-	sessionChoices       []session.Session
-	sessionChoice        int
-	sessionIncludeAll    bool
-	pendingUserInput     *userinput.Request
-	userInputQuestion    int
-	userInputChoice      int
-	userInputAnswers     map[string]string
-	userInputCustom      bool
-	userInputDraft       string
-	draftImages          []provider.Image
-	draftImageLabels     []string
-	draftContexts        []string
-	draftPastes          []string
-	collaboration        *collaboration.Manager
-	goalContinuations    int
-	turnStarted          time.Time
-	inputTokens          int64
-	outputTokens         int64
-	toolSucceeded        int
-	toolFailed           int
-	lastLatency          time.Duration
-	renderCacheWidth     int
-	vimNormal            bool
+	ctx                     context.Context
+	externalContext         context.Context
+	lifecycleContext        context.Context
+	modelProvider           provider.Provider
+	runner                  *agent.Runner
+	options                 Options
+	input                   textarea.Model
+	viewport                viewport.Model
+	spinner                 spinner.Model
+	initialFocus            tea.Cmd
+	messages                []message
+	width, height           int
+	busy                    bool
+	cancelling              bool
+	cancelRunDone           bool
+	cancelSavePending       bool
+	history                 []provider.Message
+	inputHistory            []string
+	inputHistoryCursor      int
+	inputHistoryDraft       string
+	cancelCurrentRequest    context.CancelFunc
+	initialPrompt           string
+	initialPromptFired      bool
+	agentEvents             <-chan agent.Event
+	activeRun               *agent.RunHandle
+	queuedMessages          []string
+	pendingApproval         *agent.ApprovalRequest
+	approvalChoice          int
+	store                   *session.Store
+	session                 session.Session
+	skills                  *skill.Catalog
+	memory                  *memory.Store
+	taskState               *taskstate.State
+	showPlan                bool
+	planMode                bool
+	collaborationMode       prompts.Mode
+	rawMode                 bool
+	showRawTranscript       bool
+	showHelp                bool
+	commandMenuDismissed    bool
+	commandChoice           int
+	showSessionPicker       bool
+	showModelPicker         bool
+	modelQuery              string
+	modelChoices            []string
+	modelChoice             int
+	showSkillPicker         bool
+	skillQuery              string
+	skillChoices            []skill.Skill
+	skillChoice             int
+	sessionQuery            string
+	sessionChoices          []session.Metadata
+	sessionChoice           int
+	sessionIncludeAll       bool
+	sessionWarnings         []string
+	sessionPickerError      string
+	sessionPickerLoading    bool
+	sessionPickerActivating bool
+	sessionPickerRequest    uint64
+	pendingUserInput        *userinput.Request
+	userInputQuestion       int
+	userInputChoice         int
+	userInputAnswers        map[string]string
+	userInputCustom         bool
+	userInputDraft          string
+	draftImages             []provider.Image
+	draftImageLabels        []string
+	draftContexts           []string
+	draftPastes             []string
+	collaboration           *collaboration.Manager
+	goalContinuations       int
+	turnStarted             time.Time
+	inputTokens             int64
+	outputTokens            int64
+	toolSucceeded           int
+	toolFailed              int
+	lastLatency             time.Duration
+	renderCacheWidth        int
+	transcriptPrefix        string
+	transcriptPrefixTail    string
+	transcriptPrefixCut     bool
+	transcriptTailCut       bool
+	transcriptPrefixSize    int
+	vimNormal               bool
+	activePrompt            string
+	activeImages            []provider.Image
+	turnMessageStart        int
+	turnPreparing           bool
+	turnGeneration          uint64
+	pendingCompletion       bool
+	sessionJobs             []sessionJob
+	sessionJobRunning       bool
+	sessionBlocking         int
+	attachmentJobs          int
+	runtimeJobs             int
+	exiting                 bool
+	exitVisible             bool
+	exitSessionStarted      bool
+	exitSessionSaved        bool
+	exitSessionFailed       bool
+	exitAgentsStarted       bool
+	exitAgentsPending       bool
+	exitMemoryStarted       bool
+	exitMemoryPending       bool
+	exitCancel              context.CancelFunc
+	exitQuitScheduled       bool
 }
 
 type initialPromptMsg string
 type agentEventMsg struct {
-	events <-chan agent.Event
-	event  agent.Event
-	ok     bool
+	events   <-chan agent.Event
+	event    agent.Event
+	trailing *agent.Event
+	ok       bool
 }
 type userInputMsg struct {
 	requests <-chan *userinput.Request
 	request  *userinput.Request
 }
+
+type toolStatusMsg struct {
+	name   string
+	result tool.Result
+	err    error
+}
+
+type mentionLoadedMsg struct {
+	path   string
+	result tool.Result
+	err    error
+}
+
+type imageLoadedMsg struct {
+	label  string
+	images []provider.Image
+	err    error
+}
+
+type clipboardWrittenMsg struct {
+	target string
+	err    error
+}
+
+type memoryCommandMsg struct {
+	action  string
+	content string
+	err     error
+}
+
+type turnPreparedMsg struct {
+	generation     uint64
+	ctx            context.Context
+	prompt         string
+	images         []provider.Image
+	history        []provider.Message
+	instructions   string
+	memoryCaptured bool
+	memoryErr      error
+	err            error
+}
+
+type skillReloadedMsg struct {
+	count int
+	err   error
+}
+
+type exitVisibleMsg struct{}
+type exitTimeoutMsg struct{}
+type exitMemoryMsg struct{ err error }
+type exitAgentsMsg struct{ err error }
+type exitQuitMsg struct{}
+type externalExitMsg struct{}
 
 var (
 	accent       = lipgloss.Color("#8B5CF6")
@@ -190,13 +297,26 @@ func Run(ctx context.Context, modelProvider provider.Provider, options Options, 
 	if options.Timeout <= 0 {
 		return errors.New("TUI timeout must be greater than zero")
 	}
+	if err := validateDraftImages(nil, options.InitialImages); err != nil {
+		return err
+	}
 	if options.AlternateScreen {
 		if _, err := io.WriteString(output, enableAlternateScroll); err != nil {
 			return fmt.Errorf("enable terminal alternate scrolling: %w", err)
 		}
 		defer func() { _, _ = io.WriteString(output, disableAlternateScroll) }()
 	}
-	program := tea.NewProgram(newModel(ctx, modelProvider, options), tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output), tea.WithoutSignalHandler())
+	// Convert process cancellation into a model message instead of letting it
+	// kill Bubble Tea. The model then joins the active turn and saves durable
+	// state before the program context is cancelled.
+	programContext, cancelProgram := context.WithCancel(context.Background())
+	defer cancelProgram()
+	modelContext, cancelModel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelModel()
+	initial := newModel(modelContext, modelProvider, options)
+	initial.externalContext = ctx
+	initial.lifecycleContext = programContext
+	program := tea.NewProgram(initial, tea.WithContext(programContext), tea.WithInput(input), tea.WithOutput(output), tea.WithoutSignalHandler())
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrInterrupted) || errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil {
 		return nil
@@ -267,12 +387,13 @@ func newModel(ctx context.Context, modelProvider provider.Provider, options Opti
 	}
 	mode := prompts.NormalizeMode(currentSession.Mode)
 	result := model{
-		ctx: ctx, runner: runner, options: options, input: input, viewport: chatViewport,
+		ctx: ctx, modelProvider: modelProvider, runner: runner, options: options, input: input, viewport: chatViewport,
 		spinner: activity, initialFocus: initialFocus, initialPrompt: strings.TrimSpace(options.InitialPrompt),
 		store: options.SessionStore, session: currentSession, skills: options.Skills, memory: options.Memory,
 		taskState: options.TaskState, showPlan: true, planMode: mode == prompts.ModePlan, collaborationMode: mode,
 		collaboration: options.Collaboration,
 		draftImages:   append([]provider.Image(nil), options.InitialImages...), draftImageLabels: append([]string(nil), options.InitialImageLabels...),
+		turnMessageStart: -1, inputHistoryCursor: -1,
 	}
 	if options.Collaboration != nil {
 		_ = options.Collaboration.Restore(currentSession.Agents)
@@ -280,11 +401,22 @@ func newModel(ctx context.Context, modelProvider provider.Provider, options Opti
 	if len(currentSession.Messages) > 0 {
 		result.loadHistory(currentSession.Messages)
 	}
+	for _, warning := range options.StartupWarnings {
+		if strings.TrimSpace(warning) != "" {
+			result.messages = append(result.messages, message{role: "status", content: "Warning: " + warning})
+		}
+	}
+	if len(options.StartupWarnings) > 0 {
+		result.refreshMessages(true)
+	}
 	return result
 }
 
 func (m model) Init() tea.Cmd {
 	commands := []tea.Cmd{m.initialFocus}
+	if m.externalContext != nil && m.lifecycleContext != nil {
+		commands = append(commands, waitExternalExit(m.externalContext, m.lifecycleContext))
+	}
 	if m.initialPrompt != "" {
 		prompt := m.initialPrompt
 		commands = append(commands, func() tea.Msg { return initialPromptMsg(prompt) })
@@ -293,6 +425,17 @@ func (m model) Init() tea.Cmd {
 		commands = append(commands, nextUserInput(m.options.UserInput.Requests()))
 	}
 	return tea.Batch(commands...)
+}
+
+func waitExternalExit(externalContext, lifecycleContext context.Context) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case <-externalContext.Done():
+			return externalExitMsg{}
+		case <-lifecycleContext.Done():
+			return nil
+		}
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
@@ -320,11 +463,176 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 			// new one. Never let a stale event take ownership of the new stream.
 			return m, nil
 		}
+		if m.cancelling {
+			if !msg.ok {
+				m.cancelRunDone = true
+				m.agentEvents = nil
+				if !m.cancelSavePending {
+					cancelled, command := m.completeCancellation()
+					return cancelled.advanceExit(command)
+				}
+				m.resize(m.width, m.height)
+				return m, nil
+			}
+			// Ignore output emitted after cancellation, but keep draining until the
+			// runner closes its event stream. Channel closure is the join barrier
+			// that prevents a new turn from overlapping the cancelled one.
+			return m, nextAgentEvent(msg.events)
+		}
 		if !msg.ok {
 			return m.finish(nil)
 		}
 		m.agentEvents = msg.events
-		return m.handleAgentEvent(msg.event)
+		updated, command := m.handleAgentEvent(msg.event)
+		if msg.trailing == nil {
+			return updated, command
+		}
+		// nextAgentEvent may coalesce a burst of text deltas and retain the
+		// first following control event. Process that event in order without
+		// launching a second reader for the same channel.
+		m = updated.(model)
+		return m.handleAgentEvent(*msg.trailing)
+	case sessionJobMsg:
+		updated, command := m.handleSessionJob(msg)
+		return updated.(model).advanceExit(command)
+	case turnPreparedMsg:
+		if msg.generation != m.turnGeneration {
+			return m, nil
+		}
+		m.turnPreparing = false
+		if m.cancelling {
+			m.cancelRunDone = true
+			if !m.cancelSavePending {
+				cancelled, command := m.completeCancellation()
+				return cancelled.advanceExit(command)
+			}
+			return m.advanceExit(nil)
+		}
+		if msg.err != nil {
+			m.addError("Prepare turn: " + msg.err.Error())
+			return m.finish(msg.err)
+		}
+		if msg.memoryErr != nil {
+			m.addError("Auto-capture memory: " + msg.memoryErr.Error())
+		} else if msg.memoryCaptured {
+			m.addStatus("Captured a preference in long-term memory.")
+		}
+		run := m.runner.Start(msg.ctx, agent.Input{
+			Prompt: msg.prompt, History: msg.history, Instructions: msg.instructions, Images: msg.images,
+		})
+		m.activeRun, m.agentEvents = run, run.Events
+		m.input.Placeholder = "Send a message after the next tool call…"
+		return m, tea.Batch(nextAgentEvent(run.Events), m.input.Focus())
+	case toolStatusMsg:
+		if m.runtimeJobs > 0 {
+			m.runtimeJobs--
+		}
+		if msg.err != nil {
+			m.addError(msg.err.Error())
+		} else if msg.result.IsError {
+			m.addError(msg.result.Content)
+		} else {
+			m.addStatus(msg.result.Content)
+		}
+		return m.advanceExit(nil)
+	case mentionLoadedMsg:
+		if m.attachmentJobs > 0 {
+			m.attachmentJobs--
+		}
+		if msg.err != nil {
+			m.addError(msg.err.Error())
+		} else if msg.result.IsError {
+			m.addError(msg.result.Content)
+		} else {
+			m.draftContexts = append(m.draftContexts, "File: "+msg.path+"\n```\n"+msg.result.Content+"\n```")
+			m.addStatus("Attached " + msg.path + " to the next message.")
+			m.resize(m.width, m.height)
+		}
+		return m.advanceExit(nil)
+	case imageLoadedMsg:
+		if m.attachmentJobs > 0 {
+			m.attachmentJobs--
+		}
+		if msg.err != nil {
+			m.addError(msg.err.Error())
+		} else if len(msg.images) == 0 {
+			m.addError("The image loader returned no image.")
+		} else if err := validateDraftImages(m.draftImages, msg.images); err != nil {
+			m.addError(err.Error())
+		} else {
+			m.draftImages = append(m.draftImages, msg.images...)
+			for range msg.images {
+				m.draftImageLabels = append(m.draftImageLabels, msg.label)
+			}
+			m.addStatus("Attached image to the next message.")
+			m.resize(m.width, m.height)
+		}
+		return m.advanceExit(nil)
+	case clipboardWrittenMsg:
+		if m.runtimeJobs > 0 {
+			m.runtimeJobs--
+		}
+		if msg.err != nil {
+			m.addError("Clipboard is unavailable: " + msg.err.Error())
+		} else {
+			m.addStatus("Copied " + msg.target + " output.")
+		}
+		return m.advanceExit(nil)
+	case memoryCommandMsg:
+		if m.runtimeJobs > 0 {
+			m.runtimeJobs--
+		}
+		if msg.err != nil {
+			m.addError(msg.err.Error())
+		} else {
+			m.addStatus(msg.content)
+		}
+		return m.advanceExit(nil)
+	case skillReloadedMsg:
+		if m.runtimeJobs > 0 {
+			m.runtimeJobs--
+		}
+		if msg.err != nil {
+			m.addError(msg.err.Error())
+		} else {
+			m.addStatus(fmt.Sprintf("Reloaded %d skill(s).", msg.count))
+		}
+		return m.advanceExit(nil)
+	case exitVisibleMsg:
+		m.exitVisible = true
+		return m.advanceExit(nil)
+	case exitMemoryMsg:
+		m.exitMemoryPending = false
+		m.exitCancel = nil
+		if msg.err != nil {
+			m.addError("Save memory before exit: " + msg.err.Error())
+		}
+		return m.advanceExit(nil)
+	case exitAgentsMsg:
+		m.exitAgentsPending = false
+		if msg.err != nil {
+			m.addError("Stop sub-agents before exit: " + msg.err.Error())
+		}
+		return m.advanceExit(nil)
+	case exitTimeoutMsg:
+		if !m.exiting {
+			return m, nil
+		}
+		if m.exitCancel != nil {
+			m.exitCancel()
+		}
+		if m.cancelCurrentRequest != nil {
+			m.cancelCurrentRequest()
+		}
+		m.addError("Graceful exit timed out; forcing shutdown.")
+		return m.scheduleExit(nil)
+	case exitQuitMsg:
+		return m, tea.Quit
+	case externalExitMsg:
+		if m.exiting {
+			return m, nil
+		}
+		return m.beginExit()
 	case userInputMsg:
 		m.pendingUserInput = msg.request
 		m.userInputQuestion, m.userInputChoice = 0, 0
@@ -340,6 +648,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		} else {
 			m.input.SetValue(msg.content)
 			m.input.MoveToEnd()
+			m.inputHistoryCursor, m.inputHistoryDraft = -1, ""
 		}
 		m.resize(m.width, m.height)
 		return m, m.input.Focus()
@@ -348,20 +657,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 			return m, nil
 		}
 		if collapsePaste(msg.Content) {
+			m.inputHistoryCursor, m.inputHistoryDraft = -1, ""
 			m.draftPastes = append(m.draftPastes, msg.Content)
 			m.resize(m.width, m.height)
 			return m, m.input.Focus()
 		}
 		var command tea.Cmd
+		m.inputHistoryCursor, m.inputHistoryDraft = -1, ""
 		m.input, command = m.input.Update(msg)
 		m.resize(m.width, m.height)
 		return m, command
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "ctrl+q" {
-			if m.cancelCurrentRequest != nil {
-				m.cancelCurrentRequest()
-			}
-			return m, tea.Quit
+			return m.beginExit()
+		}
+		if m.exiting {
+			return m, nil
 		}
 		if m.pendingApproval != nil {
 			choices := approvalChoices(m.pendingApproval)
@@ -414,8 +725,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		if m.showSkillPicker {
 			return m.updateSkillPicker(msg)
 		}
-		if m.busy && msg.String() == "esc" {
+		if m.busy && !m.pendingCompletion && msg.String() == "esc" {
 			return m.stopCurrentTurn()
+		}
+		if (m.cancelling || m.turnPreparing || m.pendingCompletion || m.sessionBlocking > 0 || m.attachmentJobs > 0 || m.runtimeJobs > 0) && msg.String() == "enter" {
+			m.addStatus("Please wait for the current background operation to finish.")
+			return m, nil
 		}
 		if m.commandMenuVisible() {
 			switch msg.String() {
@@ -481,6 +796,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 			m.viewport.PageDown()
 			return m, nil
 		case "up":
+			if m.navigateInputHistory(-1) {
+				m.resize(m.width, m.height)
+				return m, m.input.Focus()
+			}
 			// With DEC alternate-scroll enabled, a terminal converts wheel-up
 			// events to cursor-up keys while mouse reporting remains disabled.
 			// Reserve those keys for the transcript only when no draft is being
@@ -490,6 +809,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 				return m, nil
 			}
 		case "down":
+			if m.navigateInputHistory(1) {
+				m.resize(m.width, m.height)
+				return m, m.input.Focus()
+			}
 			if m.input.Value() == "" && !m.viewport.AtBottom() {
 				m.viewport.ScrollDown(3)
 				return m, nil
@@ -514,6 +837,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 			if prompt == "" && len(m.draftPastes) == 0 {
 				return m, nil
 			}
+			historyValue := prompt
+			if len(m.draftPastes) > 0 {
+				_, historyValue = m.promptWithPastes(prompt)
+			}
+			m.rememberInput(historyValue)
 			m.input.Reset()
 			m.commandMenuDismissed = false
 			m.commandChoice = 0
@@ -559,6 +887,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 	m.input, command = m.input.Update(msg)
 	commands = append(commands, command)
 	if m.input.Value() != beforeInput {
+		m.inputHistoryCursor, m.inputHistoryDraft = -1, ""
 		m.commandMenuDismissed = false
 		m.commandChoice = 0
 	}
@@ -566,6 +895,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		m.resize(m.width, m.height)
 	}
 	return m, tea.Batch(commands...)
+}
+
+func validateDraftImages(current, addition []provider.Image) error {
+	return validateDraftImagesWithLimits(current, addition, maxDraftImages, maxDraftImageBytes)
+}
+
+func validateDraftImagesWithLimits(current, addition []provider.Image, imageLimit int, byteLimit int64) error {
+	if len(addition) > imageLimit-len(current) {
+		return fmt.Errorf("Draft images exceed the %d-image limit.", imageLimit)
+	}
+	var total int64
+	add := func(image provider.Image) error {
+		decoded := int64(base64.StdEncoding.DecodedLen(len(image.Data)))
+		if strings.HasSuffix(image.Data, "=") {
+			decoded--
+		}
+		if strings.HasSuffix(image.Data, "==") {
+			decoded--
+		}
+		if decoded > byteLimit-total {
+			return fmt.Errorf("Draft images exceed the aggregate %d MiB limit.", byteLimit/(1024*1024))
+		}
+		total += max(0, decoded)
+		return nil
+	}
+	for _, image := range current {
+		if err := add(image); err != nil {
+			return err
+		}
+	}
+	for _, image := range addition {
+		if err := add(image); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m model) View() tea.View {
@@ -582,10 +947,26 @@ func (m model) View() tea.View {
 	if strings.EqualFold(m.options.Keymap, "vim") && m.vimNormal {
 		footer = "VIM NORMAL  ·  i insert  ·  h/j/k/l move  ·  x delete  ·  /help commands"
 	}
-	if m.pendingApproval != nil {
+	if m.exiting {
+		footer = m.spinner.View() + " Saving session/memory before exit…  ·  Ctrl+C force quit"
+	} else if m.pendingApproval != nil {
 		footer = "↑/↓ select  ·  Enter confirm  ·  y once  ·  a tool/session  ·  p prefix/session  ·  r remember"
 	} else if m.pendingUserInput != nil {
 		footer = "↑/↓ select  ·  Enter confirm  ·  o custom answer  ·  Esc cancel"
+	} else if m.cancelling {
+		footer = m.spinner.View() + " Stopping… waiting for the active runner to exit"
+	} else if m.turnPreparing {
+		footer = m.spinner.View() + " Preparing turn…  ·  Esc stop"
+	} else if m.showSessionPicker && m.sessionPickerLoading {
+		footer = m.spinner.View() + " Loading sessions…  ·  Esc close"
+	} else if m.pendingCompletion || m.sessionBlocking > 0 {
+		footer = m.spinner.View() + " Saving session…"
+	} else if m.attachmentJobs > 0 {
+		footer = m.spinner.View() + " Loading attachment…"
+	} else if m.runtimeJobs > 0 {
+		footer = m.spinner.View() + " Running local operation…"
+	} else if m.busy {
+		footer = m.spinner.View() + " Working…  ·  Esc stop  ·  Enter queue guidance for the next tool boundary"
 	} else if m.commandMenuVisible() {
 		footer = "↑/↓ select  ·  Tab complete  ·  Enter choose/run  ·  Esc close"
 	} else if m.showSessionPicker {
@@ -596,8 +977,6 @@ func (m model) View() tea.View {
 		footer = "Type to search  ·  ↑/↓ select  ·  Enter insert skill  ·  Esc close"
 	} else if m.showHelp || m.showRawTranscript {
 		footer = "PgUp/PgDn scroll  ·  Esc close view  ·  Type / to run a command"
-	} else if m.busy {
-		footer = m.spinner.View() + " Working…  ·  Esc stop  ·  Enter queue guidance for the next tool boundary"
 	}
 	footer = statusStyle.Width(width).PaddingLeft(1).Render(footer)
 	parts := []string{header}

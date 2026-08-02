@@ -23,6 +23,18 @@ config_version: 1
 url: https://api.openai.com/v1
 model: gpt-5.6
 # models: [gpt-5.6]
+# Multiple endpoints can be configured instead of url/token/models:
+# providers:
+#   - name: openai
+#     provider: openai
+#     url: https://api.openai.com/v1
+#     token: ${OPENAI_API_KEY}
+#     models: [gpt-5.6]
+#   - name: anthropic
+#     provider: anthropic
+#     url: https://api.anthropic.com
+#     token: ${ANTHROPIC_API_KEY}
+#     models: [claude-sonnet-4-6]
 # model_catalog:
 #   gpt-5.6:
 #     context_window_tokens: 272000
@@ -98,6 +110,19 @@ type Hook struct {
 	SHA256  string   `yaml:"sha256,omitempty"`
 }
 
+// ProviderConfig describes one named model endpoint. Provider selects the wire
+// protocol: openai, openai_responses, anthropic, or openrouter.
+type ProviderConfig struct {
+	Name         string            `yaml:"name"`
+	Provider     string            `yaml:"provider"`
+	URL          string            `yaml:"url,omitempty"`
+	Token        string            `yaml:"token,omitempty"`
+	TokenCommand []string          `yaml:"token_command,omitempty"`
+	Models       []string          `yaml:"models"`
+	MaxTokens    int64             `yaml:"maxTokens,omitempty"`
+	Headers      map[string]string `yaml:"headers,omitempty"`
+}
+
 // File is the user-editable YAML configuration stored in ~/.supercode.
 // Stream is a pointer so an omitted value can be distinguished from false.
 type File struct {
@@ -105,6 +130,7 @@ type File struct {
 	URL                          string                               `yaml:"url"`
 	Model                        string                               `yaml:"model"`
 	Models                       []string                             `yaml:"models,omitempty"`
+	Providers                    []ProviderConfig                     `yaml:"providers,omitempty"`
 	ModelCatalog                 map[string]modelcatalog.Capabilities `yaml:"model_catalog,omitempty"`
 	ReasoningEffort              string                               `yaml:"reasoning_effort,omitempty"`
 	ServiceTier                  string                               `yaml:"service_tier,omitempty"`
@@ -245,6 +271,9 @@ func Load(path string) (File, error) {
 			return File{}, fmt.Errorf("model_catalog.%s: %w", name, err)
 		}
 	}
+	if err := validateProviders(result.Providers); err != nil {
+		return File{}, err
+	}
 	for category := range result.ApprovalCategories {
 		switch strings.ToLower(strings.TrimSpace(category)) {
 		case "tool", "file", "shell", "network", "mcp", "skill", "permission":
@@ -302,6 +331,9 @@ func Merge(base, overlay File) File {
 	}
 	if len(overlay.Models) > 0 {
 		result.Models = append([]string(nil), overlay.Models...)
+	}
+	if len(overlay.Providers) > 0 {
+		result.Providers = cloneProviders(overlay.Providers)
 	}
 	if len(overlay.ModelCatalog) > 0 {
 		result.ModelCatalog = make(map[string]modelcatalog.Capabilities, len(base.ModelCatalog)+len(overlay.ModelCatalog))
@@ -461,6 +493,62 @@ func Merge(base, overlay File) File {
 		}
 		for event, hooks := range overlay.Hooks {
 			result.Hooks[event] = append(result.Hooks[event], hooks...)
+		}
+	}
+	return result
+}
+
+func validateProviders(values []ProviderConfig) error {
+	seen := make(map[string]bool, len(values))
+	for index, value := range values {
+		name := strings.TrimSpace(value.Name)
+		if name == "" {
+			return fmt.Errorf("providers[%d].name is required", index)
+		}
+		if strings.Contains(name, "/") {
+			return fmt.Errorf("providers[%d].name must not contain '/'", index)
+		}
+		if seen[name] {
+			return fmt.Errorf("providers: duplicate name %q", name)
+		}
+		seen[name] = true
+		switch strings.ToLower(strings.TrimSpace(value.Provider)) {
+		case "openai", "openai_responses", "anthropic", "openrouter":
+		default:
+			return fmt.Errorf("providers[%d].provider %q is not supported", index, value.Provider)
+		}
+		if len(value.Models) == 0 {
+			return fmt.Errorf("providers[%d].models must not be empty", index)
+		}
+		if value.MaxTokens < 0 {
+			return fmt.Errorf("providers[%d].maxTokens must not be negative", index)
+		}
+		models := make(map[string]bool, len(value.Models))
+		for _, model := range value.Models {
+			model = strings.TrimSpace(model)
+			if model == "" {
+				return fmt.Errorf("providers[%d].models contains an empty model", index)
+			}
+			if models[model] {
+				return fmt.Errorf("providers[%d].models contains duplicate %q", index, model)
+			}
+			models[model] = true
+		}
+	}
+	return nil
+}
+
+func cloneProviders(values []ProviderConfig) []ProviderConfig {
+	result := make([]ProviderConfig, len(values))
+	for index, value := range values {
+		result[index] = value
+		result[index].Models = append([]string(nil), value.Models...)
+		result[index].TokenCommand = append([]string(nil), value.TokenCommand...)
+		if value.Headers != nil {
+			result[index].Headers = make(map[string]string, len(value.Headers))
+			for name, header := range value.Headers {
+				result[index].Headers[name] = header
+			}
 		}
 	}
 	return result

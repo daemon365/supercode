@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daemon365/supercode/internal/provider"
@@ -27,24 +28,33 @@ func Builtins(root string) ([]Tool, error) {
 }
 
 func BuiltinsWithOptions(root string, options SandboxOptions) ([]Tool, error) {
+	tools, _, err := BuiltinsWithLifecycle(root, options)
+	return tools, err
+}
+
+// BuiltinsWithLifecycle returns the standard tools together with the owner of
+// background process resources. Long-lived hosts must close the lifecycle when
+// shutting down; Builtins and BuiltinsWithOptions remain for compatibility.
+func BuiltinsWithLifecycle(root string, options SandboxOptions) ([]Tool, io.Closer, error) {
 	workspace, err := newWorkspaceWithOptions(root, options)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sandbox := newCommandSandbox(workspace)
+	processes := newProcessManager(workspace, sandbox)
 	tools := []Tool{
 		&listFilesTool{workspace}, &searchTextTool{workspace}, &readFileTool{workspace},
 		&applyPatchTool{workspace},
 		&gitTool{workspace: workspace, name: "git_status"},
 		&gitTool{workspace: workspace, name: "git_diff"},
 	}
-	tools = append(tools, newProcessManager(workspace, sandbox).tools()...)
+	tools = append(tools, processes.tools()...)
 	tools = append(tools, &viewImageTool{workspace: workspace})
 	tools = append(tools, newWebTool(options.Permissions))
 	if options.Permissions != nil {
 		tools = append(tools, newRequestPermissionsTool(options.Permissions))
 	}
-	return tools, nil
+	return tools, processes, nil
 }
 
 // SandboxStatus describes the command boundary selected for a workspace.
@@ -67,7 +77,8 @@ func (*listFilesTool) Category() Category { return CategoryFile }
 func (*listFilesTool) Definition() provider.ToolDefinition {
 	return definition("list_files", "List files under the workspace or another configured read root. Hidden files are included; .git is excluded.", `{"type":"object","properties":{"path":{"type":"string","description":"Workspace-relative path or an absolute path inside a configured read root (default: .)"},"max_entries":{"type":"integer","minimum":1,"maximum":1000}},"additionalProperties":false}`)
 }
-func (*listFilesTool) Risk(string) Risk { return RiskRead }
+func (*listFilesTool) Risk(string) Risk         { return RiskRead }
+func (*listFilesTool) ParallelSafe(string) bool { return true }
 func (*listFilesTool) Summary(arguments string) string {
 	return argumentSummary("list files", arguments)
 }
@@ -132,6 +143,7 @@ func (*readFileTool) Definition() provider.ToolDefinition {
 	return definition("read_file", "Read a UTF-8 text file from the workspace or a configured read root, with optional one-based line bounds.", `{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}`)
 }
 func (*readFileTool) Risk(string) Risk                { return RiskRead }
+func (*readFileTool) ParallelSafe(string) bool        { return true }
 func (*readFileTool) Summary(arguments string) string { return argumentSummary("read file", arguments) }
 func (t *readFileTool) Execute(_ context.Context, arguments string) (Result, error) {
 	var input struct {
@@ -142,11 +154,7 @@ func (t *readFileTool) Execute(_ context.Context, arguments string) (Result, err
 	if err := decodeArguments(arguments, &input); err != nil {
 		return Result{}, err
 	}
-	path, err := t.resolve(input.Path, false)
-	if err != nil {
-		return Result{}, err
-	}
-	file, err := os.Open(path)
+	file, _, err := t.openRead(input.Path)
 	if err != nil {
 		return Result{}, err
 	}
@@ -193,7 +201,8 @@ func (*searchTextTool) Category() Category { return CategoryFile }
 func (*searchTextTool) Definition() provider.ToolDefinition {
 	return definition("search_text", "Search text with ripgrep-compatible regex, glob, case, and hidden-file controls.", `{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"Workspace-relative path (default: .)"},"regex":{"type":"boolean","description":"interpret query as a regular expression"},"glob":{"type":"string","description":"include/exclude glob such as *.go or !vendor/**"},"case_sensitive":{"type":"boolean"},"hidden":{"type":"boolean"},"max_results":{"type":"integer","minimum":1,"maximum":500}},"required":["query"],"additionalProperties":false}`)
 }
-func (*searchTextTool) Risk(string) Risk { return RiskRead }
+func (*searchTextTool) Risk(string) Risk         { return RiskRead }
+func (*searchTextTool) ParallelSafe(string) bool { return true }
 func (*searchTextTool) Summary(arguments string) string {
 	return argumentSummary("search text", arguments)
 }
@@ -241,21 +250,74 @@ func (t *searchTextTool) Execute(ctx context.Context, arguments string) (Result,
 		}
 		arguments = append(arguments, "--", input.Query, root)
 		command := exec.CommandContext(ctx, ripgrep, arguments...)
-		content, runErr := command.Output()
+		configureProcessTree(command, false)
+		command.WaitDelay = time.Second
+		defer cleanupProcessTree(command)
+		stdout, pipeErr := command.StdoutPipe()
+		if pipeErr != nil {
+			return Result{}, fmt.Errorf("ripgrep output pipe: %w", pipeErr)
+		}
+		var stderr limitedBuffer
+		command.Stderr = &stderr
+		if startErr := command.Start(); startErr != nil {
+			return Result{}, fmt.Errorf("start ripgrep search: %w", startErr)
+		}
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 64*1024), 2*maxToolOutput)
+		var output limitedBuffer
+		matches := 0
+		resultLimitReached := false
+		stoppedEarly := false
+		for scanner.Scan() {
+			if matches >= input.Max {
+				resultLimitReached = true
+				stoppedEarly = true
+				_ = terminateProcessTree(command)
+				break
+			}
+			line := strings.TrimPrefix(scanner.Text(), root+string(filepath.Separator))
+			if matches > 0 {
+				_, _ = output.Write([]byte("\n"))
+			}
+			_, _ = output.Write([]byte(line))
+			matches++
+			if output.Truncated() {
+				stoppedEarly = true
+				_ = terminateProcessTree(command)
+				break
+			}
+		}
+		scanErr := scanner.Err()
+		if scanErr != nil {
+			_ = terminateProcessTree(command)
+		}
+		runErr := command.Wait()
+		if scanErr != nil {
+			return Result{}, fmt.Errorf("read ripgrep output: %w", scanErr)
+		}
 		if runErr != nil {
+			if stoppedEarly {
+				runErr = nil
+			}
 			if exitErr, ok := runErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 				return Result{Content: "No matches found."}, nil
 			}
-			return Result{}, fmt.Errorf("ripgrep search: %w", runErr)
+			if runErr != nil {
+				message := strings.TrimSpace(stderr.String())
+				if message != "" {
+					return Result{}, fmt.Errorf("ripgrep search: %w: %s", runErr, message)
+				}
+				return Result{}, fmt.Errorf("ripgrep search: %w", runErr)
+			}
 		}
-		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-		if len(lines) > input.Max {
-			lines = append(lines[:input.Max], "[results truncated]")
+		if matches == 0 {
+			return Result{Content: "No matches found."}, nil
 		}
-		for index, line := range lines {
-			lines[index] = strings.TrimPrefix(line, root+string(filepath.Separator))
+		content := strings.TrimSpace(output.String())
+		if resultLimitReached && !output.Truncated() {
+			content += "\n[results truncated]"
 		}
-		return Result{Content: truncate(strings.Join(lines, "\n"))}, nil
+		return Result{Content: content}, nil
 	}
 	if input.Regex || input.Glob != "" || input.Hidden {
 		return Result{}, errors.New("advanced search requires ripgrep (rg) on PATH")
@@ -322,7 +384,7 @@ type applyPatchTool struct{ workspace }
 func (*applyPatchTool) Category() Category { return CategoryFile }
 
 func (*applyPatchTool) Definition() provider.ToolDefinition {
-	return definition("apply_patch", "Atomically create, edit, delete, move, or apply unified-diff hunks to workspace files. An operations array may repeat a path: entries run in array order against the cumulative in-memory result, then commit atomically. Supply complete literal content for every created or replaced section; never use omission placeholders. expected_sha256 rejects stale changes.", `{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"delete":{"type":"boolean"},"move_to":{"type":"string"},"expected_sha256":{"type":"string"},"unified_diff":{"type":"string"},"operations":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"delete":{"type":"boolean"},"move_to":{"type":"string"},"expected_sha256":{"type":"string"}},"required":["path"],"additionalProperties":false}}},"anyOf":[{"required":["path"]},{"required":["operations"]},{"required":["unified_diff"]}],"additionalProperties":false}`)
+	return definition("apply_patch", "Atomically create, edit, delete, move, or apply unified-diff hunks to workspace files. Provide path for one edit, operations for a batch, or unified_diff for a unified diff. An operations array may repeat a path: entries run in array order against the cumulative in-memory result, then commit atomically. Supply complete literal content for every created or replaced section; never use omission placeholders. expected_sha256 rejects stale changes.", `{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"delete":{"type":"boolean"},"move_to":{"type":"string"},"expected_sha256":{"type":"string"},"unified_diff":{"type":"string"},"operations":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"delete":{"type":"boolean"},"move_to":{"type":"string"},"expected_sha256":{"type":"string"}},"required":["path"],"additionalProperties":false}}},"additionalProperties":false}`)
 }
 func (*applyPatchTool) Risk(string) Risk { return RiskWrite }
 func (*applyPatchTool) Summary(arguments string) string {
@@ -374,6 +436,9 @@ func (t *runCommandTool) Execute(ctx context.Context, arguments string) (Result,
 	escalated := input.Permissions == "require-escalated"
 	readOnly := readOnlyShellCommand(input.Command) && !escalated
 	command := t.sandbox.command(commandContext, "/bin/sh", []string{"-lc", input.Command}, t.workspace.root, !readOnly, escalated)
+	configureProcessTree(command, false)
+	command.WaitDelay = time.Second
+	defer cleanupProcessTree(command)
 	var output limitedBuffer
 	command.Stdout, command.Stderr = &output, &output
 	err := command.Run()
@@ -397,11 +462,12 @@ type gitTool struct {
 
 func (t *gitTool) Definition() provider.ToolDefinition {
 	if t.name == "git_status" {
-		return definition(t.name, "Show concise Git workspace status.", `{"type":"object","additionalProperties":false}`)
+		return definition(t.name, "Show concise Git workspace status.", `{"type":"object","properties":{},"additionalProperties":false}`)
 	}
 	return definition(t.name, "Show the current Git diff. Unstaged output includes untracked text files by default.", `{"type":"object","properties":{"staged":{"type":"boolean"},"include_untracked":{"type":"boolean"}},"additionalProperties":false}`)
 }
-func (*gitTool) Risk(string) Risk { return RiskRead }
+func (*gitTool) Risk(string) Risk         { return RiskRead }
+func (*gitTool) ParallelSafe(string) bool { return true }
 func (t *gitTool) Summary(arguments string) string {
 	return argumentSummary(strings.ReplaceAll(t.name, "_", " "), arguments)
 }
@@ -421,6 +487,9 @@ func (t *gitTool) Execute(ctx context.Context, arguments string) (Result, error)
 		}
 	}
 	command := exec.CommandContext(ctx, "git", args...)
+	configureProcessTree(command, false)
+	command.WaitDelay = time.Second
+	defer cleanupProcessTree(command)
 	command.Dir = t.root
 	var output limitedBuffer
 	command.Stdout, command.Stderr = &output, &output
@@ -441,14 +510,39 @@ func (t *gitTool) Execute(ctx context.Context, arguments string) (Result, error)
 
 func (t *gitTool) appendUntrackedDiffs(ctx context.Context, output *limitedBuffer) error {
 	list := exec.CommandContext(ctx, "git", "ls-files", "--others", "--exclude-standard", "-z")
+	configureProcessTree(list, false)
+	list.WaitDelay = time.Second
 	list.Dir = t.root
-	data, err := list.Output()
+	stdout, err := list.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("list untracked files: %w", err)
+		return fmt.Errorf("list untracked files output pipe: %w", err)
 	}
-	for _, raw := range bytes.Split(data, []byte{0}) {
-		path := string(raw)
-		if path == "" || output.truncated {
+	var stderr limitedBuffer
+	list.Stderr = &stderr
+	if err := list.Start(); err != nil {
+		return fmt.Errorf("start listing untracked files: %w", err)
+	}
+	waited := false
+	defer func() {
+		if !waited {
+			if list.Process != nil {
+				_ = terminateProcessTree(list)
+			}
+			_ = list.Wait()
+		}
+	}()
+	scanner := bufio.NewScanner(stdout)
+	scanner.Split(scanNUL)
+	scanner.Buffer(make([]byte, 4096), maxToolOutput)
+	stoppedEarly := false
+	for scanner.Scan() {
+		path := scanner.Text()
+		if path == "" || output.Truncated() {
+			if output.Truncated() {
+				stoppedEarly = true
+				_ = terminateProcessTree(list)
+				break
+			}
 			continue
 		}
 		absolute, err := t.resolve(path, false)
@@ -460,16 +554,46 @@ func (t *gitTool) appendUntrackedDiffs(ctx context.Context, output *limitedBuffe
 			continue
 		}
 		command := exec.CommandContext(ctx, "git", "diff", "--no-index", "--no-ext-diff", "--", os.DevNull, path)
+		configureProcessTree(command, false)
+		command.WaitDelay = time.Second
 		command.Dir = t.root
 		command.Stdout, command.Stderr = output, output
-		if err := command.Run(); err != nil {
+		runErr := command.Run()
+		cleanupProcessTree(command)
+		if err := runErr; err != nil {
 			var exit *exec.ExitError
 			if !errors.As(err, &exit) || exit.ExitCode() != 1 {
 				return fmt.Errorf("diff untracked file %s: %w", path, err)
 			}
 		}
 	}
+	scanErr := scanner.Err()
+	if scanErr != nil {
+		_ = terminateProcessTree(list)
+	}
+	waitErr := list.Wait()
+	waited = true
+	if scanErr != nil {
+		return fmt.Errorf("read untracked file list: %w", scanErr)
+	}
+	if waitErr != nil && !stoppedEarly {
+		message := strings.TrimSpace(stderr.String())
+		if message != "" {
+			return fmt.Errorf("list untracked files: %w: %s", waitErr, message)
+		}
+		return fmt.Errorf("list untracked files: %w", waitErr)
+	}
 	return nil
+}
+
+func scanNUL(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if index := bytes.IndexByte(data, 0); index >= 0 {
+		return index + 1, data[:index], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 func definition(name, description, schema string) provider.ToolDefinition {
@@ -512,13 +636,28 @@ func truncate(value string) string {
 }
 
 type limitedBuffer struct {
-	bytes.Buffer
+	mu        sync.Mutex
+	buffer    bytes.Buffer
 	truncated bool
 }
 
+func (b *limitedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Len()
+}
+
+func (b *limitedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
+}
+
 func (b *limitedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	original := len(value)
-	remaining := maxToolOutput - b.Len()
+	remaining := maxToolOutput - b.buffer.Len()
 	if remaining <= 0 {
 		b.truncated = true
 		return original, nil
@@ -527,11 +666,13 @@ func (b *limitedBuffer) Write(value []byte) (int, error) {
 		value = value[:remaining]
 		b.truncated = true
 	}
-	_, _ = b.Buffer.Write(value)
+	_, _ = b.buffer.Write(value)
 	return original, nil
 }
 func (b *limitedBuffer) String() string {
-	value := b.Buffer.String()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	value := b.buffer.String()
 	if b.truncated {
 		value += "\n[output truncated]"
 	}

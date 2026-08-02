@@ -2,7 +2,9 @@
 package instructions
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,22 +68,32 @@ func Discover(options Options) (Set, error) {
 				continue
 			}
 			path := filepath.Join(directory, name)
-			info, statErr := os.Lstat(path)
-			if statErr != nil {
-				if os.IsNotExist(statErr) {
+			file, openErr := openInstructionNoFollow(path)
+			if openErr != nil {
+				if os.IsNotExist(openErr) {
 					continue
 				}
-				return Set{}, fmt.Errorf("inspect project instructions %s: %w", path, statErr)
+				if errors.Is(openErr, errInstructionSymlink) {
+					continue
+				}
+				return Set{}, fmt.Errorf("open project instructions %s: %w", path, openErr)
 			}
-			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			info, statErr := file.Stat()
+			if statErr != nil {
+				_ = file.Close()
+				return Set{}, fmt.Errorf("inspect opened project instructions %s: %w", path, statErr)
+			}
+			if !info.Mode().IsRegular() {
+				_ = file.Close()
 				continue
 			}
-			if info.Size() > int64(maximum-used) {
-				return Set{}, fmt.Errorf("project instructions exceed the %d-byte limit at %s", maximum, path)
-			}
-			content, readErr := os.ReadFile(path)
+			content, readErr := readInstruction(file, info, maximum-used, maximum, path)
+			closeErr := file.Close()
 			if readErr != nil {
 				return Set{}, fmt.Errorf("read project instructions %s: %w", path, readErr)
+			}
+			if closeErr != nil {
+				return Set{}, fmt.Errorf("close project instructions %s: %w", path, closeErr)
 			}
 			used += len(content)
 			result.Documents = append(result.Documents, Document{Path: path, Content: string(content)})
@@ -91,14 +103,32 @@ func Discover(options Options) (Set, error) {
 	return result, nil
 }
 
+func readInstruction(file *os.File, info os.FileInfo, remaining, maximum int, path string) ([]byte, error) {
+	if remaining < 0 || info.Size() > int64(remaining) {
+		return nil, fmt.Errorf("project instructions exceed the %d-byte limit at %s", maximum, path)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, int64(remaining)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > remaining {
+		return nil, fmt.Errorf("project instructions exceed the %d-byte limit at %s", maximum, path)
+	}
+	return content, nil
+}
+
 func FindProjectRoot(path string) string {
 	current, err := filepath.Abs(path)
 	if err != nil {
 		return path
 	}
 	for {
-		if info, statErr := os.Stat(filepath.Join(current, ".git")); statErr == nil && info.IsDir() {
-			return current
+		if info, statErr := os.Stat(filepath.Join(current, ".git")); statErr == nil {
+			// Linked worktrees and submodules use a regular `.git` indirection
+			// file instead of a directory. Both forms mark the project boundary.
+			if info.IsDir() || info.Mode().IsRegular() {
+				return current
+			}
 		}
 		parent := filepath.Dir(current)
 		if parent == current {

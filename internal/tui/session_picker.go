@@ -12,29 +12,67 @@ import (
 	"github.com/daemon365/supercode/internal/session"
 )
 
-func (m *model) openSessionPicker(includeArchived bool) {
+type sessionListResult struct {
+	request         uint64
+	includeArchived bool
+	items           []session.Metadata
+}
+
+type sessionLoadContext struct {
+	request uint64
+}
+
+func (m *model) openSessionPicker(includeArchived bool) tea.Cmd {
 	if m.store == nil {
 		m.addError("Session storage is unavailable.")
-		return
-	}
-	values, err := m.store.ListAll(m.options.Workspace, 200, includeArchived)
-	if err != nil {
-		m.addError(err.Error())
-		return
+		return nil
 	}
 	m.showSessionPicker = true
-	m.sessionIncludeAll = includeArchived
 	m.sessionQuery = ""
-	m.sessionChoices = values
 	m.sessionChoice = 0
+	m.sessionWarnings = nil
+	m.sessionPickerError = ""
+	m.sessionPickerActivating = false
 	m.input.Blur()
+	command := m.loadSessionChoices(includeArchived)
 	m.resize(m.width, m.height)
+	return command
+}
+
+func (m *model) loadSessionChoices(includeArchived bool) tea.Cmd {
+	m.sessionPickerRequest++
+	request := m.sessionPickerRequest
+	m.sessionIncludeAll = includeArchived
+	m.sessionChoices = nil
+	m.sessionChoice = 0
+	m.sessionWarnings = nil
+	m.sessionPickerError = ""
+	m.sessionPickerLoading = true
+	m.sessionPickerActivating = false
+	store, workspace := m.store, m.options.Workspace
+	return m.enqueueSessionJob(sessionJob{action: sessionActionList, run: func() sessionJobResult {
+		items, warnings, err := store.ListMetadata(workspace, "", 200, includeArchived)
+		return sessionJobResult{
+			action: sessionActionList,
+			payload: sessionListResult{
+				request: request, includeArchived: includeArchived, items: items,
+			},
+			warnings: warnings,
+			err:      err,
+		}
+	}})
 }
 
 func (m model) updateSessionPicker(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch message.String() {
 	case "esc":
+		if m.sessionPickerActivating {
+			return m, nil
+		}
 		m.showSessionPicker = false
+		m.sessionPickerLoading = false
+		m.sessionPickerActivating = false
+		m.sessionPickerRequest++ // Ignore a list/load result that completes later.
 		m.resize(m.width, m.height)
 		return m, m.input.Focus()
 	case "up", "ctrl+p":
@@ -50,8 +88,12 @@ func (m model) updateSessionPicker(message tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		}
 		return m, nil
 	case "tab":
-		m.openSessionPicker(!m.sessionIncludeAll)
-		return m, nil
+		if m.sessionPickerLoading {
+			return m, nil
+		}
+		command := m.loadSessionChoices(!m.sessionIncludeAll)
+		m.resize(m.width, m.height)
+		return m, command
 	case "backspace":
 		runes := []rune(m.sessionQuery)
 		if len(runes) > 0 {
@@ -61,6 +103,9 @@ func (m model) updateSessionPicker(message tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		}
 		return m, nil
 	case "enter":
+		if m.sessionPickerLoading {
+			return m, nil
+		}
 		matches := m.filteredSessions()
 		if len(matches) == 0 {
 			return m, nil
@@ -68,10 +113,17 @@ func (m model) updateSessionPicker(message tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		if m.sessionChoice >= len(matches) {
 			m.sessionChoice = 0
 		}
-		m.resumeSession(matches[m.sessionChoice])
-		m.showSessionPicker = false
+		selected := matches[m.sessionChoice]
+		m.sessionPickerLoading = true
+		m.sessionPickerError = ""
+		request := m.sessionPickerRequest
+		store := m.store
+		command := m.enqueueSessionJob(sessionJob{action: sessionActionLoad, blocking: true, run: func() sessionJobResult {
+			loaded, err := store.Load(selected.ID)
+			return sessionJobResult{action: sessionActionLoad, value: loaded, payload: sessionLoadContext{request: request}, err: err}
+		}})
 		m.resize(m.width, m.height)
-		return m, m.input.Focus()
+		return m, command
 	}
 	if message.Text != "" && !strings.Contains(message.String(), "ctrl+") {
 		m.sessionQuery += message.Text
@@ -81,18 +133,21 @@ func (m model) updateSessionPicker(message tea.KeyPressMsg) (tea.Model, tea.Cmd)
 	return m, nil
 }
 
-func (m model) filteredSessions() []session.Session {
+func (m model) filteredSessions() []session.Metadata {
 	query := strings.ToLower(strings.TrimSpace(m.sessionQuery))
 	if query == "" {
-		return append([]session.Session(nil), m.sessionChoices...)
+		return append([]session.Metadata(nil), m.sessionChoices...)
 	}
 	type ranked struct {
-		value session.Session
+		value session.Metadata
 		score int
 	}
 	var values []ranked
 	for _, item := range m.sessionChoices {
-		candidate := strings.ToLower(sessionSearchText(item))
+		candidate := strings.ToLower(item.SearchText)
+		if candidate == "" {
+			candidate = strings.ToLower(strings.Join([]string{item.Title, item.ID, item.Model, item.Workspace}, " "))
+		}
 		score, ok := slashFuzzyScore(candidate, query)
 		if !ok {
 			continue
@@ -105,21 +160,11 @@ func (m model) filteredSessions() []session.Session {
 		}
 		return values[left].score < values[right].score
 	})
-	result := make([]session.Session, 0, len(values))
+	result := make([]session.Metadata, 0, len(values))
 	for _, item := range values {
 		result = append(result, item.value)
 	}
 	return result
-}
-
-func sessionSearchText(value session.Session) string {
-	parts := []string{value.Title, value.ID, value.Model, value.Workspace}
-	for _, message := range value.Messages {
-		if strings.TrimSpace(message.Content) != "" {
-			parts = append(parts, message.Content)
-		}
-	}
-	return strings.Join(parts, " ")
 }
 
 func (m model) renderSessionPicker(width int) string {
@@ -127,7 +172,26 @@ func (m model) renderSessionPicker(width int) string {
 		return ""
 	}
 	matches := m.filteredSessions()
-	rows := []string{titleStyle.Render("Resume a session"), detailStyle.Render("Search: " + m.sessionQuery)}
+	archiveLabel := "active only"
+	if m.sessionIncludeAll {
+		archiveLabel = "including archived"
+	}
+	rows := []string{
+		titleStyle.Render("Resume a session"),
+		detailStyle.Render("Search: " + m.sessionQuery + "  ·  " + archiveLabel),
+	}
+	for _, warning := range m.sessionWarnings {
+		rows = append(rows, errorStyle.Render("Warning: "+preview(warning, 120)))
+		if len(rows) >= 5 {
+			break
+		}
+	}
+	if m.sessionPickerError != "" {
+		rows = append(rows, errorStyle.Render("Error: "+preview(m.sessionPickerError, 120)))
+	}
+	if m.sessionPickerLoading {
+		rows = append(rows, detailStyle.Render("Loading session data…"))
+	}
 	limit := min(7, len(matches))
 	for index := 0; index < limit; index++ {
 		item := matches[index]
@@ -144,22 +208,13 @@ func (m model) renderSessionPicker(width int) string {
 		}
 		rows = append(rows, style.Render(fmt.Sprintf("%s%s  %s%s", marker, item.UpdatedAt.Local().Format("Jan 02 15:04"), preview(title, 54), archived)))
 		if index == m.sessionChoice {
-			rows = append(rows, detailStyle.Render("    "+shortID(item.ID)+" · "+item.Model+" · "+sessionPreview(item)))
+			rows = append(rows, detailStyle.Render(fmt.Sprintf("    %s · %s · %d messages", shortID(item.ID), defaultString(item.Model, "unknown model"), item.MessageCount)))
 		}
 	}
-	if len(matches) == 0 {
+	if len(matches) == 0 && !m.sessionPickerLoading && m.sessionPickerError == "" {
 		rows = append(rows, detailStyle.Render("No matching sessions."))
 	}
 	return lipgloss.NewStyle().Width(max(10, width-2)).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1).Render(strings.Join(rows, "\n"))
-}
-
-func sessionPreview(value session.Session) string {
-	for _, item := range value.Messages {
-		if string(item.Role) == "user" && strings.TrimSpace(item.Content) != "" {
-			return preview(strings.Join(strings.Fields(item.Content), " "), 70)
-		}
-	}
-	return "no messages"
 }
 
 func (m model) sessionPickerHeight() int {
@@ -169,19 +224,18 @@ func (m model) sessionPickerHeight() int {
 	return 0
 }
 
-func (m *model) resumeSession(loaded session.Session) {
+func (m *model) resumeSession(loaded session.Session, agentsRestored bool) error {
 	if loaded.Workspace != m.options.Workspace {
-		m.addError("The session belongs to a different workspace.")
-		return
+		return fmt.Errorf("the session belongs to a different workspace")
+	}
+	if m.collaboration != nil && !agentsRestored {
+		return fmt.Errorf("session agents were not restored before activation")
 	}
 	m.session = loaded
 	m.setCollaborationMode(prompts.NormalizeMode(loaded.Mode))
 	if m.taskState != nil {
 		m.taskState.Restore(loaded.Plan, loaded.Goal)
 	}
-	if m.collaboration != nil {
-		_ = m.collaboration.Restore(loaded.Agents)
-	}
 	m.loadHistory(loaded.Messages)
-	m.addStatus("Resumed session " + loaded.ID + ".")
+	return nil
 }

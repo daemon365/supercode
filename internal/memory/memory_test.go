@@ -3,6 +3,8 @@ package memory
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +57,75 @@ func TestExplicitNotesSummaryInjectionAndClear(t *testing.T) {
 	notes, err = os.ReadDir(filepath.Join(root, "extensions", "ad_hoc", "notes"))
 	if err != nil || len(notes) != 0 {
 		t.Fatalf("notes after clear = %v, err = %v", notes, err)
+	}
+}
+
+func TestAtomicWriteUsesPrivateModeAndRejectsOversizedData(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "artifact.md")
+	if err := atomicWrite(path, []byte("saved\n")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %o, want 600", info.Mode().Perm())
+	}
+	rejected := filepath.Join(root, "rejected.md")
+	if err := atomicWrite(rejected, make([]byte, maximumArtifactBytes+1)); err == nil {
+		t.Fatal("expected oversized write to fail")
+	}
+	if _, err := os.Stat(rejected); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected path exists or returned unexpected error: %v", err)
+	}
+}
+
+func TestBoundedMemoryReadRejectsGrowthAndSymlinks(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "memory_summary.md")
+	if err := os.WriteFile(path, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openMemoryNoFollow(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("grew beyond bound"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readOpenedPrivateFile(file, info, 3); err == nil {
+		t.Fatal("expected bounded reader to reject growth after Stat")
+	}
+	target := filepath.Join(root, "target.md")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPrivateFile(link, maximumArtifactBytes); err == nil {
+		t.Fatal("memory reader followed a symbolic link")
+	}
+}
+
+func TestStateReadIsBounded(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "memories")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "state.json"), make([]byte, maximumArtifactBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(root); err == nil {
+		t.Fatal("expected oversized state.json to be rejected")
 	}
 }
 
@@ -176,6 +247,15 @@ type pipelineProvider struct {
 	requests  []provider.Request
 }
 
+type failingPipelineProvider struct{ err error }
+
+func (p *failingPipelineProvider) Generate(context.Context, provider.Request) (provider.Response, error) {
+	return provider.Response{}, p.err
+}
+func (*failingPipelineProvider) Stream(context.Context, provider.Request) (provider.Stream, error) {
+	panic("unexpected stream")
+}
+
 func (p *pipelineProvider) Generate(_ context.Context, request provider.Request) (provider.Response, error) {
 	p.requests = append(p.requests, request)
 	response := p.responses[0]
@@ -270,6 +350,308 @@ func TestStartupPipelineSkipsCurrentAndChildSessions(t *testing.T) {
 	}
 	if report.Eligible != 1 || report.Extracted != 1 || !report.Consolidated || len(model.requests) != 2 {
 		t.Fatalf("report=%+v requests=%d", report, len(model.requests))
+	}
+}
+
+func TestShutdownPipelineExtractsRecentlyCommittedCurrentSessionOnce(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(filepath.Join(directory, "memories"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := DefaultConfig()
+	configuration.Generate = true
+	store.ConfigureAdvanced(configuration)
+	sessions, err := session.NewStore(filepath.Join(directory, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := sessions.New("/workspace", "active-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Messages = []provider.Message{
+		{Role: provider.MessageRoleUser, Content: "Always run the focused package test first."},
+		{Role: provider.MessageRoleAssistant, Content: "Understood."},
+	}
+	if err := sessions.Commit(current); err != nil {
+		t.Fatal(err)
+	}
+	extractionJSON, _ := json.Marshal(extractionOutput{RawMemory: "Run focused package tests first.", RolloutSummary: "Focused testing preference."})
+	consolidationJSON, _ := json.Marshal(consolidationOutput{MemoryMD: "# Testing\nRun focused package tests first.\n", MemorySummaryMD: "Focused testing preference."})
+	changedExtractionJSON, _ := json.Marshal(extractionOutput{RawMemory: "Run focused package tests and race tests.", RolloutSummary: "Focused and race testing preference."})
+	changedConsolidationJSON, _ := json.Marshal(consolidationOutput{MemoryMD: "# Testing\nRun focused package and race tests.\n", MemorySummaryMD: "Focused and race testing preference."})
+	model := &pipelineProvider{responses: []provider.Response{
+		{Text: string(extractionJSON)}, {Text: string(consolidationJSON)},
+		{Text: string(changedExtractionJSON)}, {Text: string(changedConsolidationJSON)},
+	}}
+
+	report, err := store.RunShutdown(context.Background(), model, sessions, current.ID, "active-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Eligible != 1 || report.Extracted != 1 || !report.Consolidated || len(model.requests) != 2 {
+		t.Fatalf("report=%+v requests=%d", report, len(model.requests))
+	}
+	unchanged, err := sessions.Load(current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.Commit(unchanged); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.RunShutdown(context.Background(), model, sessions, current.ID, "active-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Eligible != 0 || len(model.requests) != 2 {
+		t.Fatalf("deduplicated report=%+v requests=%d", second, len(model.requests))
+	}
+	changed, err := sessions.Load(current.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.Messages = append(changed.Messages, provider.Message{Role: provider.MessageRoleUser, Content: "Also run the race detector."})
+	if err := sessions.Commit(changed); err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.RunShutdown(context.Background(), model, sessions, current.ID, "active-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Eligible != 1 || third.Extracted != 1 || len(model.requests) != 4 {
+		t.Fatalf("changed report=%+v requests=%d", third, len(model.requests))
+	}
+}
+
+func TestShutdownPipelineReturnsCurrentExtractionFailure(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(filepath.Join(directory, "memories"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := DefaultConfig()
+	configuration.Generate = true
+	store.ConfigureAdvanced(configuration)
+	sessions, err := session.NewStore(filepath.Join(directory, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := sessions.New("/workspace", "active-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Messages = []provider.Message{{Role: provider.MessageRoleUser, Content: "remember this"}}
+	if err := sessions.Commit(current); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("extraction failed")
+	report, err := store.RunShutdown(context.Background(), &failingPipelineProvider{err: sentinel}, sessions, current.ID, "active-model")
+	if !errors.Is(err, sentinel) || report.Failed != 1 {
+		t.Fatalf("report=%+v err=%v", report, err)
+	}
+	extractionJSON, _ := json.Marshal(extractionOutput{RawMemory: "Retried memory.", RolloutSummary: "Retry succeeded."})
+	consolidationJSON, _ := json.Marshal(consolidationOutput{MemoryMD: "# Retry\nSucceeded.\n", MemorySummaryMD: "Retry succeeded."})
+	retry := &pipelineProvider{responses: []provider.Response{{Text: string(extractionJSON)}, {Text: string(consolidationJSON)}}}
+	retried, retryErr := store.RunShutdown(context.Background(), retry, sessions, current.ID, "active-model")
+	if retryErr != nil || retried.Extracted != 1 || len(retry.requests) != 2 {
+		t.Fatalf("retry report=%+v requests=%d err=%v", retried, len(retry.requests), retryErr)
+	}
+}
+
+func TestSelectMemoriesBoundsRawBudgetAndDoesNotReadUnusedSummaries(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "memories"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	state := newState()
+	for index := 0; index < 3; index++ {
+		name := fmt.Sprintf("raw/memory-%d.md", index)
+		content := strings.Repeat(fmt.Sprintf("memory-%d ", index), 40_000)
+		if err := atomicWrite(filepath.Join(store.root, filepath.FromSlash(name)), []byte(content)); err != nil {
+			t.Fatal(err)
+		}
+		id := fmt.Sprintf("session-%d", index)
+		state.Rollouts[id] = rolloutRecord{
+			SessionID: id, RolloutID: fmt.Sprintf("rollout-%d", index), Status: rolloutSucceeded,
+			RawPath: name, SummaryPath: "rollout_summaries/does-not-exist.md",
+			SourceUpdatedAt: now.Add(-time.Duration(index) * time.Minute), UsageCount: 3 - index,
+		}
+	}
+	store.mu.Lock()
+	err = store.saveStateUnlocked(state)
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := DefaultConfig()
+	selected, _, err := store.selectMemories(configuration, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) == 0 {
+		t.Fatal("missing summary files incorrectly excluded every raw memory")
+	}
+	total := 0
+	for _, item := range selected {
+		total += len("\n\n---\n\n\n") + len(item.raw)
+	}
+	if total > maximumSelectedRawBytes {
+		t.Fatalf("selected raw memory bytes=%d, budget=%d", total, maximumSelectedRawBytes)
+	}
+}
+
+func TestEligibleSessionsStopsBeforeHydrationWhenContextCancelled(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(filepath.Join(directory, "memories"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := session.NewStore(filepath.Join(directory, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	value, err := sessions.New("/workspace", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.UpdatedAt = now.Add(-8 * time.Hour)
+	value.Messages = []provider.Message{{Role: provider.MessageRoleUser, Content: "eligible"}}
+	if err := sessions.Commit(value); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = store.eligibleSessions(ctx, sessions, "", DefaultConfig(), now)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("eligibleSessions error=%v, want context.Canceled", err)
+	}
+}
+
+func TestEligibleSessionsMetadataOnlyBlockersDoNotStarveChangedSession(t *testing.T) {
+	directory := t.TempDir()
+	store, err := NewStore(filepath.Join(directory, "memories"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := session.NewStore(filepath.Join(directory, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration := DefaultConfig()
+	configuration.MaxRolloutsPerStartup = 1
+
+	target, err := sessions.New("/workspace", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.Messages = []provider.Message{{Role: provider.MessageRoleUser, Content: "target before"}}
+	if err := sessions.Commit(target); err != nil {
+		t.Fatal(err)
+	}
+	targetBefore, err := sessions.Load(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetHash, err := sessionSourceHash(targetBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetBefore.Messages = append(targetBefore.Messages, provider.Message{Role: provider.MessageRoleAssistant, Content: "target changed"})
+	if err := sessions.Commit(targetBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	state := newState()
+	state.Rollouts[target.ID] = rolloutRecord{
+		SessionID: target.ID, Status: rolloutSucceeded, SourceUpdatedAt: targetBefore.UpdatedAt, SourceHash: targetHash,
+	}
+	// MaxRollouts=1 yields an overscan window of nine. Put nine newer,
+	// metadata-only commits ahead of the genuinely changed target.
+	for index := 0; index < 9; index++ {
+		blocker, createErr := sessions.New("/workspace", "test")
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		blocker.Messages = []provider.Message{{Role: provider.MessageRoleUser, Content: fmt.Sprintf("unchanged-%d", index)}}
+		if err := sessions.Commit(blocker); err != nil {
+			t.Fatal(err)
+		}
+		before, err := sessions.Load(blocker.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash, err := sessionSourceHash(before)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state.Rollouts[blocker.ID] = rolloutRecord{
+			SessionID: blocker.ID, Status: rolloutSucceeded, SourceUpdatedAt: before.UpdatedAt, SourceHash: hash,
+		}
+		if err := sessions.Commit(before); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.mu.Lock()
+	err = store.saveStateUnlocked(state)
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Add(8 * time.Hour)
+	first, err := store.eligibleSessions(context.Background(), sessions, "", configuration, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 0 {
+		t.Fatalf("first bounded scan unexpectedly reached target: %#v", first)
+	}
+	second, err := store.eligibleSessions(context.Background(), sessions, "", configuration, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].ID != target.ID {
+		t.Fatalf("changed target remained starved after blockers were observed: %#v", second)
+	}
+}
+
+func TestMemoryStatePrunesDeterministicallyBeforeSizeLimit(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "memories"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := newState()
+	oldSuccess := "successful-old-record"
+	state.Rollouts[oldSuccess] = rolloutRecord{SessionID: oldSuccess, Status: rolloutSucceeded, SourceUpdatedAt: time.Unix(1, 0)}
+	sharedLargeError := strings.Repeat("x", 16*1024)
+	for index := 0; index < maximumStateRollouts+100; index++ {
+		id := fmt.Sprintf("failed-%05d", index)
+		state.Rollouts[id] = rolloutRecord{SessionID: id, Status: rolloutFailed, GeneratedAt: time.Unix(int64(index+10), 0), LastError: sharedLargeError}
+	}
+	state.AppliedNotes["removed-note.md"] = "hash"
+	state.LastPipelineError = strings.Repeat("provider failure ", 2*maximumStateBytes)
+	store.mu.Lock()
+	err = store.saveStateUnlocked(state)
+	loaded, loadErr := store.loadStateUnlocked()
+	store.mu.Unlock()
+	if err != nil || loadErr != nil {
+		t.Fatalf("save=%v load=%v", err, loadErr)
+	}
+	if len(loaded.Rollouts) != maximumStateRollouts {
+		t.Fatalf("rollout records = %d, want %d", len(loaded.Rollouts), maximumStateRollouts)
+	}
+	if _, ok := loaded.Rollouts[oldSuccess]; !ok {
+		t.Fatal("successful record was pruned before failed records")
+	}
+	if len(loaded.AppliedNotes) != 0 {
+		t.Fatalf("removed applied notes survived: %#v", loaded.AppliedNotes)
+	}
+	if info, err := os.Stat(filepath.Join(store.root, "state.json")); err != nil || info.Size() > maximumStateBytes {
+		t.Fatalf("state file info=%v err=%v", info, err)
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
+const modelPickerVisibleRows = 8
+
 func (m *model) openModelPicker() {
 	seen := make(map[string]bool)
 	values := []string{m.options.Model}
@@ -71,14 +73,18 @@ func (m model) updateModelPicker(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.addError(err.Error())
 			return m, nil
 		}
-		m.options.Model = matches[m.modelChoice]
+		m.options.Model = m.runner.Model()
 		m.syncModelLimits()
 		m.session.Model = m.options.Model
 		m.showModelPicker = false
-		m.saveSession()
 		m.addStatus("Model changed to " + m.options.Model + ".")
 		m.resize(m.width, m.height)
-		return m, m.input.Focus()
+		saveCommand, err := m.enqueueSessionSave(sessionActionSave, true, "", nil)
+		if err != nil {
+			m.addError("Prepare session save: " + err.Error())
+			return m, m.input.Focus()
+		}
+		return m, tea.Batch(saveCommand, m.input.Focus())
 	}
 	if message.Text != "" && !strings.Contains(message.String(), "ctrl+") {
 		m.modelQuery += message.Text
@@ -117,8 +123,13 @@ func (m model) renderModelPicker(width int) string {
 		return ""
 	}
 	matches := m.filteredModels()
-	rows := []string{titleStyle.Render("Choose a model"), detailStyle.Render("Search: " + m.modelQuery)}
-	for index := 0; index < min(8, len(matches)); index++ {
+	start, end := pickerWindow(m.modelChoice, len(matches), modelPickerVisibleRows)
+	searchLine := "Search: " + m.modelQuery
+	if len(matches) > modelPickerVisibleRows {
+		searchLine += fmt.Sprintf("  ·  %d-%d of %d", start+1, end, len(matches))
+	}
+	rows := []string{titleStyle.Render("Choose a model"), detailStyle.Render(searchLine)}
+	for index := start; index < end; index++ {
 		marker := "  "
 		style := lipgloss.NewStyle().Foreground(white)
 		if index == m.modelChoice {
@@ -129,7 +140,12 @@ func (m model) renderModelPicker(width int) string {
 		if matches[index] == m.options.Model {
 			current = " (current)"
 		}
-		rows = append(rows, style.Render(marker+matches[index]+current))
+		label, providerName := m.modelLabel(matches[index])
+		row := style.Render(marker + label + current)
+		if providerName != "" {
+			row += detailStyle.Render(" [in " + providerName + "]")
+		}
+		rows = append(rows, row)
 	}
 	if len(matches) == 0 {
 		rows = append(rows, detailStyle.Render("No matching configured models."))
@@ -141,6 +157,25 @@ func (m model) renderModelPicker(width int) string {
 	}
 	rows = append(rows, detailStyle.Render(m.modelCapabilityLine(selected)))
 	return lipgloss.NewStyle().Width(max(10, width-2)).Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1).Render(strings.Join(rows, "\n"))
+}
+
+func (m model) modelLabel(selector string) (string, string) {
+	for _, info := range m.options.ModelInfos {
+		if info.Selector == selector {
+			return info.ID, info.Provider
+		}
+	}
+	return selector, ""
+}
+
+func pickerWindow(choice, count, limit int) (int, int) {
+	if count <= 0 || limit <= 0 {
+		return 0, 0
+	}
+	choice = min(max(choice, 0), count-1)
+	start := max(0, choice-limit+1)
+	end := min(count, start+limit)
+	return start, end
 }
 
 func (m *model) syncModelLimits() {

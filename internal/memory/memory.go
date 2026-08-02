@@ -2,8 +2,10 @@
 package memory
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,14 +14,18 @@ import (
 )
 
 const (
-	stateVersion          = 1
-	defaultSummaryTokens  = 2_500
-	defaultReadTokens     = 20_000
-	defaultSearchResults  = 200
-	defaultListResults    = 2_000
-	maximumArtifactBytes  = 4 * 1024 * 1024
-	maximumPipelineInput  = 900_000
-	maximumAdHocNoteBytes = 64 * 1024
+	stateVersion            = 1
+	defaultSummaryTokens    = 2_500
+	defaultReadTokens       = 20_000
+	defaultSearchResults    = 200
+	defaultListResults      = 2_000
+	maximumArtifactBytes    = 4 * 1024 * 1024
+	maximumStateBytes       = 16 * 1024 * 1024
+	maximumStateRollouts    = 4096
+	maximumStateNotes       = 4096
+	maximumPipelineInput    = 900_000
+	maximumSelectedRawBytes = maximumPipelineInput / 2
+	maximumAdHocNoteBytes   = 64 * 1024
 )
 
 // Config controls generation and retrieval without coupling memory to one
@@ -73,11 +79,14 @@ func (configuration Config) normalized() Config {
 }
 
 type Store struct {
-	root       string
-	legacyPath string
-	mu         sync.Mutex
-	pipelineMu sync.Mutex
-	config     Config
+	root        string
+	legacyPath  string
+	mu          sync.Mutex
+	pipelineMu  sync.Mutex
+	startupMu   sync.Mutex
+	startupEnd  context.CancelFunc
+	startupDone chan struct{}
+	config      Config
 }
 
 // NewStore creates a directory-backed memory store. A historical memory.md
@@ -194,24 +203,44 @@ func (s *Store) Summary() (string, error) {
 }
 
 func readBoundedFile(path string, maximum int64) (string, error) {
-	info, err := os.Lstat(path)
+	data, err := readPrivateFile(path, maximum)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("inspect memory artifact: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return "", errors.New("memory artifact is not a regular file")
-	}
-	if info.Size() > maximum {
-		return "", fmt.Errorf("memory artifact exceeds %d bytes", maximum)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
 		return "", fmt.Errorf("read memory artifact: %w", err)
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+func readPrivateFile(path string, maximum int64) ([]byte, error) {
+	file, err := openMemoryNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	return readOpenedPrivateFile(file, info, maximum)
+}
+
+func readOpenedPrivateFile(file *os.File, info os.FileInfo, maximum int64) ([]byte, error) {
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("memory artifact is not a regular file")
+	}
+	if info.Size() > maximum {
+		return nil, fmt.Errorf("memory artifact exceeds %d bytes", maximum)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maximum {
+		return nil, fmt.Errorf("memory artifact exceeds %d bytes", maximum)
+	}
+	return data, nil
 }
 
 func (s *Store) Remember(value string) error {

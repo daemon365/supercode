@@ -15,7 +15,7 @@ import (
 )
 
 func (m model) submit(prompt string) (tea.Model, tea.Cmd) {
-	if prompt == "" && len(m.draftPastes) == 0 || m.busy || m.runner == nil {
+	if prompt == "" && len(m.draftPastes) == 0 || m.busy || m.cancelling || m.sessionBlocking > 0 || m.attachmentJobs > 0 || m.runtimeJobs > 0 || m.runner == nil {
 		return m, nil
 	}
 	effectivePrompt, displayPrompt := m.promptWithPastes(prompt)
@@ -26,37 +26,65 @@ func (m model) submit(prompt string) (tea.Model, tea.Cmd) {
 		displayPrompt += fmt.Sprintf("\n[%d image(s), %d context file(s) attached]", len(m.draftImageLabels), len(m.draftContexts))
 	}
 	images := append([]provider.Image(nil), m.draftImages...)
+	contextCount := len(m.draftContexts)
 	m.draftImages, m.draftImageLabels, m.draftContexts, m.draftPastes = nil, nil, nil, nil
-	m.messages = append(m.messages, message{role: "user", content: displayPrompt}, message{role: "assistant", streaming: true})
-	m.appendSessionEvent("user_prompt", map[string]string{"content": displayPrompt})
+	m.turnMessageStart = len(m.messages)
+	m.activePrompt = effectivePrompt
+	m.activeImages = append([]provider.Image(nil), images...)
+	m.messages = append(m.messages,
+		message{role: "user", content: displayPrompt, historyContent: effectivePrompt},
+		message{role: "assistant", streaming: true},
+	)
+	eventCommand := m.enqueueSessionEvent("user_prompt", map[string]any{
+		"content_bytes": len(effectivePrompt), "image_count": len(images), "context_count": contextCount,
+	})
 	m.busy = true
+	m.turnPreparing = true
+	m.turnGeneration++
+	generation := m.turnGeneration
 	m.turnStarted = time.Now()
-	m.input.Placeholder = "Send a message after the next tool call…"
+	m.input.Placeholder = "Preparing the turn…"
 	m.refreshMessages(true)
 	requestContext, cancel := context.WithCancel(m.ctx)
 	m.cancelCurrentRequest = cancel
-	skillInstructions := ""
-	if m.skills != nil {
-		skillInstructions = m.skills.Instructions(prompt)
-	}
-	memoryInstructions := ""
-	if m.memory != nil {
-		if captured, err := m.memory.AutoCapture(prompt); err != nil {
-			m.addError("Auto-capture memory: " + err.Error())
-		} else if captured {
-			m.addStatus("Captured a preference in long-term memory.")
-		}
-		memoryInstructions = m.memory.Instructions()
-	}
-	extraInstructions := prompts.Turn(prompts.TurnInput{
+	history := append([]provider.Message(nil), m.history...)
+	turnInput := prompts.TurnInput{
 		Model: m.options.Model, Mode: m.collaborationMode, Approval: string(m.options.Approval), SandboxStatus: m.options.SandboxStatus,
 		Workspace: m.options.Workspace, ContextWindowTokens: m.options.ContextWindowTokens, AutoCompactTokens: m.options.AutoCompactTokens,
-		UsableContextTokens: m.options.UsableContextTokens, MaxTurns: m.options.MaxTurns, Skills: skillInstructions,
-		Memory: memoryInstructions, Plugins: m.options.Plugins, Hooks: m.options.HookSummary, MCPServers: m.mcpServerNames(), Goal: m.goalPrompt(),
-	})
-	run := m.runner.Start(requestContext, agent.Input{Prompt: effectivePrompt, History: append([]provider.Message(nil), m.history...), Instructions: extraInstructions, Images: images})
-	m.activeRun, m.agentEvents = run, run.Events
-	return m, tea.Batch(m.spinner.Tick, nextAgentEvent(run.Events), m.input.Focus())
+		UsableContextTokens: m.options.UsableContextTokens, MaxTurns: m.options.MaxTurns,
+		Plugins: append([]string(nil), m.options.Plugins...), Hooks: append([]string(nil), m.options.HookSummary...),
+		MCPServers: m.mcpServerNames(), Goal: m.goalPrompt(),
+	}
+	skills, memories := m.skills, m.memory
+	prepareCommand := func() tea.Msg {
+		message := turnPreparedMsg{
+			generation: generation, ctx: requestContext, prompt: effectivePrompt,
+			images: append([]provider.Image(nil), images...), history: history,
+		}
+		if err := requestContext.Err(); err != nil {
+			message.err = err
+			return message
+		}
+		if skills != nil {
+			turnInput.Skills = skills.Instructions(prompt)
+		}
+		if err := requestContext.Err(); err != nil {
+			message.err = err
+			return message
+		}
+		if memories != nil {
+			message.memoryCaptured, message.memoryErr = memories.AutoCapture(prompt)
+			if err := requestContext.Err(); err != nil {
+				message.err = err
+				return message
+			}
+			turnInput.Memory = memories.Instructions()
+		}
+		message.instructions = prompts.Turn(turnInput)
+		message.err = requestContext.Err()
+		return message
+	}
+	return m, tea.Batch(m.spinner.Tick, prepareCommand, m.input.Focus(), eventCommand)
 }
 
 func (m model) promptWithPastes(prompt string) (effective, display string) {
@@ -80,6 +108,7 @@ func (m model) promptWithPastes(prompt string) (effective, display string) {
 }
 
 func (m model) handleAgentEvent(event agent.Event) (tea.Model, tea.Cmd) {
+	var eventCommand tea.Cmd
 	switch event.Type {
 	case agent.EventTextDelta:
 		m.appendAssistantDelta(event.Delta)
@@ -92,7 +121,10 @@ func (m model) handleAgentEvent(event agent.Event) (tea.Model, tea.Cmd) {
 		content := formatToolEvent(event, false)
 		m.messages = append(m.messages, message{role: "tool", callID: callID, content: content, baseContent: content, toolStarted: time.Now(), toolRunning: true})
 		if event.Call != nil {
-			m.appendSessionEvent("tool_started", map[string]any{"id": event.Call.ID, "name": event.Call.Name, "arguments": event.Call.Arguments, "risk": event.Risk})
+			eventCommand = m.enqueueSessionEvent("tool_started", map[string]any{
+				"id": event.Call.ID, "name": event.Call.Name, "risk": event.Risk,
+				"argument_bytes": len(event.Call.Arguments),
+			})
 		}
 	case agent.EventToolOutputDelta:
 		if event.Call != nil && event.Delta != "" {
@@ -145,16 +177,20 @@ func (m model) handleAgentEvent(event agent.Event) (tea.Model, tea.Cmd) {
 			m.messages = append(m.messages, message{role: "tool", content: content, copyContent: copyContent})
 		}
 		if event.Call != nil && event.Result != nil {
-			m.appendSessionEvent("tool_finished", map[string]any{"id": event.Call.ID, "name": event.Call.Name, "error": event.Result.IsError, "content": event.Result.Content})
+			eventCommand = m.enqueueSessionEvent("tool_finished", map[string]any{
+				"id": event.Call.ID, "name": event.Call.Name, "error": event.Result.IsError,
+				"result_bytes": len(event.Result.Content), "image_count": len(event.Result.Images),
+			})
 		}
 		m.resize(m.width, m.height)
 	case agent.EventQueuedCommitted:
+		m.finishStreamingAssistant()
 		for index, queued := range event.Queued {
 			visible := queued
 			if index < len(m.queuedMessages) {
 				visible = m.queuedMessages[index]
 			}
-			m.messages = append(m.messages, message{role: "user", content: visible})
+			m.messages = append(m.messages, message{role: "user", content: visible, historyContent: queued})
 		}
 		if len(event.Queued) >= len(m.queuedMessages) {
 			m.queuedMessages = nil
@@ -164,7 +200,7 @@ func (m model) handleAgentEvent(event agent.Event) (tea.Model, tea.Cmd) {
 		m.input.Placeholder = "Send a message after the next tool call…"
 		m.resize(m.width, m.height)
 	case agent.EventContextCompacted:
-		m.appendSessionEvent("context_compacted", map[string]int{"before_tokens": event.BeforeTokens, "after_tokens": event.AfterTokens})
+		eventCommand = m.enqueueSessionEvent("context_compacted", map[string]int{"before_tokens": event.BeforeTokens, "after_tokens": event.AfterTokens})
 		m.addStatus(fmt.Sprintf("Context compacted automatically: %d → %d estimated tokens.", event.BeforeTokens, event.AfterTokens))
 	case agent.EventCompleted:
 		m.finishStreamingAssistant()
@@ -176,25 +212,36 @@ func (m model) handleAgentEvent(event agent.Event) (tea.Model, tea.Cmd) {
 			m.lastLatency = time.Since(m.turnStarted)
 		}
 		m.history = append([]provider.Message(nil), event.History...)
-		m.saveSession()
+		m.activePrompt, m.activeImages, m.turnMessageStart = "", nil, -1
 		m.refreshMessages(true)
-		finished, command := m.finish(nil)
-		m = finished.(model)
-		if prompt, ok := m.nextGoalContinuation(); ok {
-			m.goalContinuations++
-			m.addStatus(fmt.Sprintf("Continuing active goal automatically (%d/20).", m.goalContinuations))
-			return m.submit(prompt)
+		m.pendingCompletion = true
+		command, err := m.enqueueSessionSave(sessionActionComplete, true, "", nil)
+		if err != nil {
+			m.pendingCompletion = false
+			m.addError("Prepare completed session: " + err.Error())
+			return m.finish(err)
 		}
-		return m, tea.Batch(command, terminalNotification(m.options.Notification, "SuperCode finished"))
+		return m, command
 	case agent.EventError:
-		m.appendSessionEvent("turn_error", map[string]string{"error": event.Err.Error()})
-		m.messages = append(m.messages, message{role: "error", content: event.Err.Error()})
+		m.finishStreamingAssistant()
+		errorText := "the provider returned an unknown error"
+		if event.Err != nil {
+			errorText = event.Err.Error()
+		}
+		m.messages = append(m.messages, message{role: "error", content: errorText})
+		m.recordInterruptedHistory()
 		m.refreshMessages(true)
-		finished, command := m.finish(event.Err)
-		return finished, tea.Batch(command, terminalNotification(m.options.Notification, "SuperCode needs attention"))
+		m.pendingCompletion = true
+		command, err := m.enqueueSessionSave(sessionActionError, true, "turn_error", map[string]bool{"occurred": true})
+		if err != nil {
+			m.pendingCompletion = false
+			m.addError("Prepare failed turn save: " + err.Error())
+			return m.finish(err)
+		}
+		return m, command
 	}
 	m.refreshMessages(true)
-	return m, nextAgentEvent(m.agentEvents)
+	return m, tea.Batch(nextAgentEvent(m.agentEvents), eventCommand)
 }
 
 func (m *model) refreshRunningToolCells() {
@@ -227,7 +274,8 @@ func (m model) finish(_ error) (tea.Model, tea.Cmd) {
 		m.cancelCurrentRequest()
 		m.cancelCurrentRequest = nil
 	}
-	m.busy, m.pendingApproval, m.activeRun = false, nil, nil
+	m.busy, m.turnPreparing, m.pendingApproval, m.activeRun = false, false, nil, nil
+	m.agentEvents = nil
 	m.queuedMessages = nil
 	m.input.Placeholder = "Ask anything or type /help…"
 	m.refreshMessages(true)
@@ -235,6 +283,9 @@ func (m model) finish(_ error) (tea.Model, tea.Cmd) {
 }
 
 func (m model) stopCurrentTurn() (tea.Model, tea.Cmd) {
+	if m.cancelling {
+		return m, nil
+	}
 	if m.cancelCurrentRequest != nil {
 		m.cancelCurrentRequest()
 		m.cancelCurrentRequest = nil
@@ -249,12 +300,67 @@ func (m model) stopCurrentTurn() (tea.Model, tea.Cmd) {
 		item.content = item.baseContent + renderLiveToolOutput(item.toolOutput) + "\n" + statusStyle.Render("    Stopped by user.")
 		item.rendered = ""
 	}
-	m.appendSessionEvent("turn_interrupted", nil)
-	m.busy, m.pendingApproval, m.activeRun = false, nil, nil
-	m.agentEvents = nil
+	m.recordInterruptedHistory()
+	m.cancelling, m.cancelRunDone = true, false
+	m.pendingApproval = nil
 	m.queuedMessages = nil
+	m.input.Placeholder = "Stopping the active turn…"
+	m.cancelSavePending = true
+	saveCommand, err := m.enqueueSessionSave(sessionActionInterrupt, true, "turn_interrupted", nil)
+	if err != nil {
+		m.cancelSavePending = false
+		m.addError("Prepare interrupted session: " + err.Error())
+	}
+	m.resize(m.width, m.height)
+	// A reader command is already in flight for a running agent, while a turn
+	// preparation command is already in flight before the runner starts. Do not
+	// launch a second reader here: its result would race the existing reader and
+	// could consume the channel-close join signal.
+	return m, saveCommand
+}
+
+func (m *model) recordInterruptedHistory() {
+	if strings.TrimSpace(m.activePrompt) == "" {
+		return
+	}
+	m.history = append(m.history, provider.Message{
+		Role: provider.MessageRoleUser, Content: m.activePrompt,
+		Images: append([]provider.Image(nil), m.activeImages...),
+	})
+	start := m.turnMessageStart
+	if start < 0 || start >= len(m.messages) {
+		start = len(m.messages)
+	}
+	for index := start; index < len(m.messages); index++ {
+		item := m.messages[index]
+		switch item.role {
+		case "user":
+			if index == start {
+				continue
+			}
+			content := item.historyContent
+			if strings.TrimSpace(content) == "" {
+				content = item.content
+			}
+			if strings.TrimSpace(content) == "" {
+				continue
+			}
+			m.history = append(m.history, provider.Message{Role: provider.MessageRoleUser, Content: content})
+		case "assistant":
+			if strings.TrimSpace(item.content) != "" {
+				m.history = append(m.history, provider.Message{Role: provider.MessageRoleAssistant, Content: item.content})
+			}
+		}
+	}
+	m.activePrompt, m.activeImages, m.turnMessageStart = "", nil, -1
+}
+
+func (m model) completeCancellation() (model, tea.Cmd) {
+	m.cancelling, m.cancelRunDone, m.cancelSavePending = false, false, false
+	m.busy, m.turnPreparing, m.pendingApproval, m.activeRun = false, false, nil, nil
+	m.agentEvents = nil
 	m.input.Placeholder = "Ask anything or type /help…"
-	m.addStatus("Generation stopped. You can send another message.")
+	m.addStatus("Generation stopped after the active runner exited. The interrupted turn was kept in session history.")
 	m.resize(m.width, m.height)
 	return m, m.input.Focus()
 }

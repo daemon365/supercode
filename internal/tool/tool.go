@@ -59,6 +59,19 @@ type Tool interface {
 	Execute(ctx context.Context, arguments string) (Result, error)
 }
 
+// Parallelizable is an explicit opt-in for tools whose read operations are
+// safe to overlap with other calls from the same model response. RiskRead by
+// itself is not sufficient: process polling and stdin transport also use that
+// risk while mutating shared runtime state.
+type Parallelizable interface {
+	ParallelSafe(arguments string) bool
+}
+
+func CanRunInParallel(item Tool, arguments string) bool {
+	parallel, ok := item.(Parallelizable)
+	return ok && item.Risk(arguments) == RiskRead && parallel.ParallelSafe(arguments)
+}
+
 // Registry keeps tool discovery independent from execution orchestration.
 type Registry struct {
 	tools map[string]Tool
@@ -138,7 +151,8 @@ func (*toolSearch) Definition() provider.ToolDefinition {
 		Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":["query"],"additionalProperties":false}`),
 	}
 }
-func (*toolSearch) Risk(string) Risk { return RiskRead }
+func (*toolSearch) Risk(string) Risk         { return RiskRead }
+func (*toolSearch) ParallelSafe(string) bool { return true }
 func (*toolSearch) Summary(arguments string) string {
 	return "search tools " + strings.Join(strings.Fields(arguments), " ")
 }
