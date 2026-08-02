@@ -17,9 +17,15 @@ go run . config init
 Edit the configuration:
 
 ```yaml
-url: https://api.openai.com/v1
-model: gpt-5.6
-models: [gpt-5.6]
+config_version: 1
+model: openai/gpt-5.6
+providers:
+  - name: openai
+    provider: openai_responses
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    # token_command: ["secret-tool", "lookup", "service", "openai"]
+    models: [gpt-5.6]
 # model_catalog:
 #   gpt-5.6:
 #     context_window_tokens: 272000
@@ -27,8 +33,6 @@ models: [gpt-5.6]
 #     tool_calling: true
 #     parallel_tool_calls: true
 fallback_models: []
-token: ""
-# token_command: ["secret-tool", "lookup", "service", "supercode"]
 stream: true
 timeout: 10m
 max_retries: 2
@@ -53,7 +57,7 @@ Then start the full-screen terminal chat:
 go run . chat
 ```
 
-The interface is built with Bubble Tea, Bubbles, Lip Gloss, and Glamour. It enters an alternate-screen page by default and restores the previous shell page on exit. Mouse reporting stays disabled so text can be selected and copied normally. Standard terminal alternate-scroll mode maps the mouse wheel to transcript scrolling while the composer is empty; `PgUp`/`PgDn` always scroll the SuperCode conversation deterministically. Use `--no-alt-screen` or `alternate_screen: false` for terminal-native persistent scrollback instead. User messages appear as gray `> message` blocks; assistant responses are rendered as GFM-compatible terminal Markdown during streaming and remain rendered after completion, without role labels. Streaming deltas are coalesced into short display frames so long Markdown and code responses do not re-render once per token. Tool activity uses dedicated tool views: commands render as `Running`, `Ran`, or a live process session; searches include the query and searched path/glob; edits render complete, untruncated line-level `Added`/`Edited`/`Deleted`/`Moved` diffs; and Plan, Web, Goal, image, session, and sub-agent tools show useful fields instead of raw JSON.
+The interface is built with Bubble Tea, Bubbles, Lip Gloss, and Glamour. It enters an alternate-screen page by default and restores the previous shell page on exit. Full-screen mode captures explicit wheel events so the mouse wheel always scrolls the conversation, even while editing a multiline draft; hold `Shift` while dragging when the terminal requires it for text selection. `PgUp`/`PgDn` also scroll the SuperCode conversation deterministically. Use `--no-alt-screen` or `alternate_screen: false` for terminal-native persistent scrollback and ordinary drag selection instead. User messages appear as gray `> message` blocks; assistant responses are rendered as GFM-compatible terminal Markdown during streaming and remain rendered after completion, without role labels. Streaming deltas are coalesced into short display frames so long Markdown and code responses do not re-render once per token. Tool activity uses dedicated tool views: commands render as `Running`, `Ran`, or a live process session; searches include the query and searched path/glob; edits render complete, untruncated line-level `Added`/`Edited`/`Deleted`/`Moved` diffs; and Plan, Web, Goal, image, session, and sub-agent tools show useful fields instead of raw JSON.
 
 - `Enter`: send a message; `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` inserts a newline
 - `↑` / `↓`: move within a multiline draft first, then recall up to 100 submitted inputs (including a loaded session's prompts) and restore the current draft when returning to the newest entry
@@ -91,7 +95,7 @@ The interface is built with Bubble Tea, Bubbles, Lip Gloss, and Glamour. It ente
 - `/help`: show grouped, Markdown-rendered command help
 - `/exit`, `/quit`, or `Ctrl+C`: begin a graceful shutdown that stops the active turn, saves the session, and (when `memory_generate: true`) processes the current session into long-term memory. Progress remains visible; press `Ctrl+C` again to force quit.
 
-Mouse reporting is disabled in both full-screen and inline modes, so ordinary drag-to-select remains available. `/copy` and `/raw` provide reliable alternatives when a terminal has unusual clipboard behavior.
+Mouse reporting is enabled only in full-screen mode so wheel events cannot leak into the composer as `Up`/`Down` keys. Use `Shift`+drag for terminal selection when required, or use `/copy` and `/raw`. Inline mode leaves mouse handling and scrollback entirely to the terminal.
 
 Bracketed pastes below 1,000 characters and fewer than nine lines stay editable in the composer. Larger pastes are folded into a `Pasted context · 12,345 chars` row inside the composer; after submission, the conversation shows the original text. Press `Backspace` or `Delete` on an empty composer to remove the most recent paste, use `/detach paste-2` to remove one by number, or use `/detach all` to clear every draft attachment.
 
@@ -230,15 +234,15 @@ Local plugins live under `~/.supercode/plugins/<name>/plugin.yaml`; trusted proj
 
 ## Configuration and precedence
 
-Values are resolved in this order:
+Matching runtime scalar values are resolved in this order:
 
 ```text
 command-line flags > environment variables > trusted project config > user config > built-in defaults
 ```
 
-The user configuration directory uses mode `0700`, and the file uses mode `0600`. Existing configuration content is never overwritten during normal startup. A project file at `.supercode/config.yaml` is ignored until the workspace is explicitly enabled with `--trust-project`; `/config` or `--config-diagnostics` shows the active sources. Trust is stored by canonical workspace path so a symlink cannot inherit another project's decision.
+The user configuration directory uses mode `0700`, and the file uses mode `0600`. Existing configuration content is never overwritten during normal startup. A project file at `.supercode/config.yaml` is ignored until the workspace is explicitly enabled with `--trust-project`; `/config` or `--config-diagnostics` shows the active sources. Trust is stored by canonical workspace path so a symlink cannot inherit another project's decision. Provider entries are self-contained blocks; CLI `--base-url` and top-level endpoint fields apply only to the legacy single-endpoint mode.
 
-For the legacy single endpoint, API-key precedence is `OPENAI_API_KEY`, then `token_command`, then YAML `token`. `token_command` executes an argument vector directly, has a five-second timeout, and reads a bounded token from stdout. It can bridge Secret Service, macOS Keychain, a password manager, or another system credential helper. A YAML token remains local plaintext; leaving it blank is safer:
+For a Provider entry, `token: ${NAME}` requires exactly that environment variable. Without an explicit environment reference, credential precedence is the provider's default environment variable, then its `token_command`, then its static YAML `token`. For the legacy single endpoint, precedence is `OPENAI_API_KEY`, then top-level `token_command`, then top-level `token`. A `token_command` executes an argument vector directly, has a five-second timeout, and reads a bounded token from stdout. It can bridge Secret Service, macOS Keychain, a password manager, or another system credential helper. A static YAML token remains local plaintext, so environment variables or credential commands are safer:
 
 ```bash
 export OPENAI_API_KEY="your_api_key"
@@ -248,9 +252,9 @@ Supported environment variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENAI_API_KEY` | API token; overrides YAML `token` |
-| `OPENAI_BASE_URL` | API base URL |
-| `OPENAI_MODEL` | Model ID |
+| `OPENAI_API_KEY` | Default OpenAI Provider token; overrides legacy top-level `token` |
+| `OPENAI_BASE_URL` | Legacy single-endpoint/CLI base URL |
+| `OPENAI_MODEL` | Default model ID or configured `provider/model` selector |
 | `ANTHROPIC_API_KEY` | Default key for an `anthropic` provider |
 | `OPENROUTER_API_KEY` | Default key for an `openrouter` provider |
 | `SUPERCODE_STREAM` | Enables or disables streaming |
@@ -284,7 +288,7 @@ supercode completion <shell>           Generate bash, zsh, fish, or PowerShell c
 Global flags:
 
 ```text
---base-url string            OpenAI API base URL
+--base-url string            Legacy single-endpoint OpenAI API base URL
 --approval string            Tool policy: on-request, granular, always, or never
 --chat                       Start multi-turn chat; TUI in a terminal, line mode in a pipe
 --config-diagnostics         Print config sources and project trust status
@@ -298,7 +302,7 @@ Global flags:
 --max-retries int            SDK retries for transient model API failures
 --max-turns int              Maximum model turns per task; 0 means unlimited
 -i, --image path             Attach an image (repeatable)
--m, --model string           Model ID
+-m, --model string           Model ID or provider/model selector
 --reasoning-effort string    Model reasoning effort
 --service-tier string        Provider service tier
 --resume string              Resume a session ID, or latest
@@ -313,20 +317,26 @@ Global flags:
 
 Run `supercode --help` or `supercode <command> --help` for generated help. Legacy single-dash long flags remain accepted for compatibility, but new scripts should use POSIX `--long-flag` syntax.
 
-## Custom endpoint
+## Provider configuration
 
-Configure an OpenAI-compatible endpoint in YAML:
+The primary configuration format uses a named `providers` list. Configure an OpenAI-compatible Chat Completions endpoint like this:
 
 ```yaml
-url: http://127.0.0.1:8000/v1
-model: your-model
-token: "your-token"
+model: local/your-model
+providers:
+  - name: local
+    provider: openai
+    url: http://127.0.0.1:8000/v1
+    token: ${LOCAL_MODEL_TOKEN}
+    models: [your-model]
 stream: true
 approval: on-request
 max_turns: 0
 ```
 
-You can also override it for a single invocation:
+Each model is addressed as `provider-name/model-id`. The configured token is sent only to that provider's URL, so connect only to services you trust. An `openai` provider must implement the OpenAI Chat Completions API and its data-only SSE format when streaming is enabled.
+
+The old top-level `url`, `token`, and `models` fields remain supported for existing single-endpoint configurations. Their URL and model can also be overridden for one invocation:
 
 ```bash
 go run . \
@@ -335,11 +345,9 @@ go run . \
   "Hello"
 ```
 
-The configured token is sent to this URL, so only connect to services you trust. A compatible service must implement the OpenAI Chat Completions API and its data-only SSE format when streaming is enabled.
+### Provider types and multiple endpoints
 
-### Multiple providers
-
-Use `providers` to select models across multiple URLs and protocols:
+Add more entries to select models across multiple URLs and protocols:
 
 ```yaml
 model: openai/gpt-4o
@@ -370,9 +378,9 @@ providers:
       X-OpenRouter-Title: SuperCode
 ```
 
-Every provider has its own `url`, `token`, and optional `token_command`; top-level endpoint credentials are not inherited by provider entries. `openai` uses `/chat/completions`, `openai_responses` uses `/responses`, `anthropic` uses `/v1/messages`, and `openrouter` uses `/chat/completions`. An Anthropic `url` may include or omit a trailing `/v1`. `token: ${NAME}` resolves that exact environment variable; when `token` is omitted, the provider defaults to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`.
+Every provider has its own `url`, `token`, and optional `token_command`; top-level legacy endpoint credentials are not inherited by provider entries. `openai` uses `/chat/completions`, `openai_responses` uses `/responses`, `anthropic` uses `/v1/messages`, and `openrouter` uses `/chat/completions`. An Anthropic `url` may include or omit a trailing `/v1`. `token: ${NAME}` resolves that exact environment variable; when `token` is omitted, the provider defaults to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`. To use a credential helper, omit `token` and configure `token_command` on that provider entry.
 
-The stable selector is `provider-name/model-id`, such as `responses/gpt-5-codex`. An unqualified model ID is accepted when it is unique; duplicate model IDs require the qualified selector. The model picker renders the identity as `gpt-5-codex [in responses]`, with the provider suffix dimmed. Legacy `url`, `token`, and `models` configuration remains supported as one OpenAI-compatible Chat Completions endpoint.
+The stable selector is `provider-name/model-id`, such as `responses/gpt-5-codex`. An unqualified model ID is accepted when it is unique; duplicate model IDs require the qualified selector. The model picker renders the identity as `gpt-5-codex [in responses]`, with the provider suffix dimmed.
 
 ## Non-interactive usage
 

@@ -18,23 +18,27 @@ const (
 )
 
 const defaultContents = `# SuperCode configuration
-# Environment variables and command-line flags override these values.
+# Runtime flags override matching scalar settings; provider entries remain self-contained.
 config_version: 1
-url: https://api.openai.com/v1
-model: gpt-5.6
-# models: [gpt-5.6]
-# Multiple endpoints can be configured instead of url/token/models:
-# providers:
-#   - name: openai
-#     provider: openai
-#     url: https://api.openai.com/v1
-#     token: ${OPENAI_API_KEY}
-#     models: [gpt-5.6]
+model: openai/gpt-5.6
+providers:
+  - name: openai
+    provider: openai_responses
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    # token_command: ["secret-tool", "lookup", "service", "openai"]
+    models: [gpt-5.6]
+# Add more named endpoints as needed:
 #   - name: anthropic
 #     provider: anthropic
 #     url: https://api.anthropic.com
 #     token: ${ANTHROPIC_API_KEY}
 #     models: [claude-sonnet-4-6]
+#   - name: openrouter
+#     provider: openrouter
+#     url: https://openrouter.ai/api/v1
+#     token: ${OPENROUTER_API_KEY}
+#     models: [openai/gpt-5.4, anthropic/claude-sonnet-4.6]
 # model_catalog:
 #   gpt-5.6:
 #     context_window_tokens: 272000
@@ -44,8 +48,6 @@ model: gpt-5.6
 # reasoning_effort: ""
 # service_tier: ""
 # fallback_models: []
-token: ""
-# token_command: ["secret-tool", "lookup", "service", "supercode"]
 stream: true
 timeout: 10m
 max_retries: 2
@@ -57,7 +59,7 @@ auto_compact_tokens: 244800 # 90%; compact history before reaching the limit
 usable_context_tokens: 258400 # 95%; reserve 5% for instructions, tools, and output
 tool_output_tokens: 12000
 goal_auto_continue: true
-alternate_screen: true # isolated TUI page; mouse selection remains terminal-native
+alternate_screen: true # isolated TUI page; mouse wheel scrolls the conversation
 # instructions: ""
 # project_doc_fallback_filenames: ["PROJECT.md"]
 # project_doc_max_bytes: 65536

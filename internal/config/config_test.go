@@ -22,8 +22,19 @@ func TestEnsureCreatesSecureConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read config: %v", err)
 	}
-	if !strings.Contains(string(contents), "token: \"\"") {
-		t.Fatalf("starter config does not contain an empty token: %s", contents)
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("load starter config: %v", err)
+	}
+	if loaded.Model != "openai/gpt-5.6" || len(loaded.Providers) != 1 {
+		t.Fatalf("starter provider config = model %q, providers %#v", loaded.Model, loaded.Providers)
+	}
+	starter := loaded.Providers[0]
+	if starter.Name != "openai" || starter.Provider != "openai_responses" || starter.URL != DefaultURL || starter.Token != "${OPENAI_API_KEY}" || len(starter.Models) != 1 || starter.Models[0] != "gpt-5.6" {
+		t.Fatalf("starter provider = %#v", starter)
+	}
+	if loaded.URL != "" || loaded.Token != "" || len(loaded.Models) != 0 {
+		t.Fatalf("starter config unexpectedly uses legacy endpoint fields: %#v", loaded)
 	}
 	if !strings.Contains(string(contents), "memory_generate: false") || !strings.Contains(string(contents), "memory_use: true") {
 		t.Fatalf("starter config does not document file-backed memory: %s", contents)
