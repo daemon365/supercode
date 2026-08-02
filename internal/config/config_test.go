@@ -102,6 +102,55 @@ func TestLoadRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestLoadMultipleProviders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	contents := `model: copilot/gpt-4
+providers:
+  - name: copilot
+    provider: openai_responses
+    url: http://127.0.0.1:3000/v1
+    token: ${COPILOT_API_KEY}
+    models: [gpt-4, gpt-5-codex]
+  - name: claude
+    provider: anthropic
+    token: ${ANTHROPIC_API_KEY}
+    maxTokens: 4096
+    models: [claude-sonnet-4-6]
+`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Providers) != 2 || loaded.Providers[0].URL != "http://127.0.0.1:3000/v1" || loaded.Providers[1].MaxTokens != 4096 {
+		t.Fatalf("providers = %#v", loaded.Providers)
+	}
+}
+
+func TestLoadRejectsLegacyProviderCredentialNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "providers:\n  - {name: one, provider: openai, baseUrl: https://one.example/v1, apiKey: secret, models: [one]}\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "field baseUrl not found") {
+		t.Fatalf("Load() error = %v, want unknown legacy field", err)
+	}
+}
+
+func TestLoadRejectsDuplicateProviderNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	contents := "providers:\n  - {name: same, provider: openai, models: [one]}\n  - {name: same, provider: anthropic, models: [two]}\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("duplicate provider names were accepted")
+	}
+}
+
 func TestMergeProjectConfiguration(t *testing.T) {
 	stream := false
 	base := File{

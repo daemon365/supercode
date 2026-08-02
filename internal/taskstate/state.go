@@ -167,10 +167,11 @@ func (t *createGoalTool) Execute(_ context.Context, args string) (tool.Result, e
 type getGoalTool struct{ state *State }
 
 func (*getGoalTool) Definition() provider.ToolDefinition {
-	return definition("get_goal", "Get the active or most recent long-term goal and its status.", `{"type":"object","additionalProperties":false}`)
+	return definition("get_goal", "Get the active or most recent long-term goal and its status.", `{"type":"object","properties":{},"additionalProperties":false}`)
 }
-func (*getGoalTool) Risk(string) tool.Risk { return tool.RiskRead }
-func (*getGoalTool) Summary(string) string { return "get goal status" }
+func (*getGoalTool) Risk(string) tool.Risk    { return tool.RiskRead }
+func (*getGoalTool) ParallelSafe(string) bool { return true }
+func (*getGoalTool) Summary(string) string    { return "get goal status" }
 func (t *getGoalTool) Execute(_ context.Context, args string) (tool.Result, error) {
 	var empty struct{}
 	if err := decode(args, &empty); err != nil {

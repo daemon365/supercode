@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -29,9 +30,32 @@ func TestNewRequiresAPIKey(t *testing.T) {
 }
 
 func TestErrorsRedactAPIKey(t *testing.T) {
-	err := redactedError("request failed", errors.New("authorization secret-key was rejected"), "secret-key")
+	cause := context.Canceled
+	err := redactedError("request failed", fmt.Errorf("authorization secret-key was rejected: %w", cause), "secret-key")
 	if strings.Contains(err.Error(), "secret-key") || !strings.Contains(err.Error(), "[REDACTED]") {
 		t.Fatalf("error was not redacted: %v", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("redacted error lost its cause: %v", err)
+	}
+}
+
+func TestGenerateRejectsNullCompletion(t *testing.T) {
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader("null")), Request: request}, nil
+	})
+	client := sdk.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL("https://null.example.test"), option.WithHTTPClient(&http.Client{Transport: transport}))
+	model := &Provider{client: client}
+	if _, err := model.Generate(context.Background(), provider.Request{Model: "test", Prompt: "hello"}); err == nil || !strings.Contains(err.Error(), "null response") {
+		t.Fatalf("null completion error = %v", err)
+	}
+}
+
+func TestBoundedResponseBodyReturnsExplicitLimitError(t *testing.T) {
+	body := provider.NewBoundedResponseBody(io.NopCloser(strings.NewReader("123456")), 5)
+	value, err := io.ReadAll(body)
+	if !errors.Is(err, provider.ErrHTTPResponseTooLarge) || string(value) != "12345" {
+		t.Fatalf("bounded body value=%q err=%v", value, err)
 	}
 }
 
@@ -277,6 +301,29 @@ data: [DONE]
 	}
 	if completed.FinishReason != "tool_calls" {
 		t.Fatalf("finish reason = %q", completed.FinishReason)
+	}
+}
+
+func TestStreamRejectsEOFWithoutFinishReason(t *testing.T) {
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body := `data: {"id":"truncated","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+data: [DONE]
+
+`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+	})
+	client := sdk.NewClient(option.WithAPIKey("test-key"), option.WithBaseURL("https://truncated.example.test"), option.WithHTTPClient(&http.Client{Transport: transport}))
+	model := &Provider{client: client}
+	stream, err := model.Stream(context.Background(), provider.Request{Model: "test", Prompt: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	for stream.Next() {
+	}
+	if err := stream.Err(); err == nil || !strings.Contains(err.Error(), "finish reason") {
+		t.Fatalf("truncated stream error = %v", err)
 	}
 }
 

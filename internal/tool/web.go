@@ -1,8 +1,8 @@
 package tool
 
 import (
+	"container/list"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +14,14 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/daemon365/supercode/internal/attachment"
 	"github.com/daemon365/supercode/internal/permission"
 	"github.com/daemon365/supercode/internal/provider"
 )
@@ -28,13 +30,42 @@ type webTool struct {
 	client      *http.Client
 	mu          sync.Mutex
 	next        int
-	pages       map[string]webPage
+	pages       map[string]*webCacheEntry
+	recent      *list.List
+	cacheBytes  int64
+	cacheLimit  int64
 	permissions *permission.Manager
 }
 type webPage struct {
 	URL, Body, ContentType string
 	Links                  []string
 }
+
+type webCacheEntry struct {
+	id      string
+	page    webPage
+	bytes   int64
+	element *list.Element
+}
+
+const (
+	defaultWebCacheBytes = 16 * 1024 * 1024
+	duckDuckGoEndpoint   = "https://html.duckduckgo.com/"
+	bingImagesEndpoint   = "https://www.bing.com/"
+	yahooFinanceEndpoint = "https://query1.finance.yahoo.com/"
+	weatherGeoEndpoint   = "https://geocoding-api.open-meteo.com/"
+	weatherAPIEndpoint   = "https://api.open-meteo.com/"
+	espnSportsEndpoint   = "https://site.api.espn.com/"
+	maxCachedPageLinks   = 256
+	maxCachedLinkBytes   = 4 * 1024 * 1024
+	maxWebURLBytes       = 16 * 1024
+	maxWebArgumentsBytes = 1024 * 1024
+	maxWebOperations     = 16
+	maxWebResultImages   = 2
+	maxWebResultImageRaw = 20 * 1024 * 1024
+	maxWebScreenshotSide = 2048
+	webScreenshotTimeout = 30 * time.Second
+)
 
 var (
 	anchorPattern   = regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
@@ -55,7 +86,7 @@ func newWebTool(permissions *permission.Manager) *webTool {
 			return nil, err
 		}
 		for _, address := range addresses {
-			if address.IP.IsLoopback() || address.IP.IsPrivate() || address.IP.IsLinkLocalUnicast() || address.IP.IsUnspecified() {
+			if !publicWebIP(address.IP) {
 				return nil, errors.New("web access to private or local addresses is blocked")
 			}
 		}
@@ -64,75 +95,167 @@ func newWebTool(permissions *permission.Manager) *webTool {
 		}
 		return dialer.DialContext(ctx, network, net.JoinHostPort(addresses[0].IP.String(), port))
 	}}
-	return &webTool{client: &http.Client{Transport: transport, Timeout: 25 * time.Second}, pages: make(map[string]webPage), permissions: permissions}
+	result := &webTool{
+		pages: make(map[string]*webCacheEntry), recent: list.New(), cacheLimit: defaultWebCacheBytes,
+		permissions: permissions,
+	}
+	result.client = &http.Client{Transport: transport, Timeout: 25 * time.Second, CheckRedirect: result.checkRedirect}
+	return result
 }
 
 func (*webTool) Category() Category { return CategoryNetwork }
 
 func (*webTool) Definition() provider.ToolDefinition {
-	return definition("web__run", "Run web operations. Supports search_query, open, click, find, screenshot (PDF pages), image_query, finance, weather, sports, and time. Network requests require approval.", `{"type":"object","properties":{"search_query":{"type":"array","items":{"type":"object","properties":{"q":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"recency":{"type":"integer"}},"required":["q"]}},"open":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"lineno":{"type":"integer"}},"required":["ref_id"]}},"click":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"id":{"type":"integer"}},"required":["ref_id","id"]}},"find":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"pattern":{"type":"string"}},"required":["ref_id","pattern"]}},"screenshot":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"pageno":{"type":"integer","minimum":0}},"required":["ref_id","pageno"]}},"image_query":{"type":"array","items":{"type":"object","properties":{"q":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"recency":{"type":"integer"}},"required":["q"]}},"finance":{"type":"array","items":{"type":"object","properties":{"ticker":{"type":"string"},"type":{"type":"string"},"market":{"type":"string"}},"required":["ticker","type"]}},"weather":{"type":"array","items":{"type":"object","properties":{"location":{"type":"string"},"start":{"type":"string"},"duration":{"type":"integer"}},"required":["location"]}},"sports":{"type":"array","items":{"type":"object","properties":{"fn":{"type":"string","enum":["schedule","standings"]},"league":{"type":"string"},"team":{"type":"string"},"date_from":{"type":"string"},"date_to":{"type":"string"},"num_games":{"type":"integer"}},"required":["fn","league"]}},"time":{"type":"array","items":{"type":"object","properties":{"utc_offset":{"type":"string"}},"required":["utc_offset"]}},"response_length":{"type":"string","enum":["short","medium","long"]}},"additionalProperties":false}`)
+	return webDefinitionWithLimits(definition("web__run", "Run web operations. Supports search_query, open, click, find, screenshot (PDF pages), image_query, finance, weather, sports, and time. Network requests require approval.", `{"type":"object","properties":{"search_query":{"type":"array","items":{"type":"object","properties":{"q":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"recency":{"type":"integer"}},"required":["q"]}},"open":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"lineno":{"type":"integer"}},"required":["ref_id"]}},"click":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"id":{"type":"integer"}},"required":["ref_id","id"]}},"find":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"pattern":{"type":"string"}},"required":["ref_id","pattern"]}},"screenshot":{"type":"array","items":{"type":"object","properties":{"ref_id":{"type":"string"},"pageno":{"type":"integer","minimum":0}},"required":["ref_id","pageno"]}},"image_query":{"type":"array","items":{"type":"object","properties":{"q":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"recency":{"type":"integer"}},"required":["q"]}},"finance":{"type":"array","items":{"type":"object","properties":{"ticker":{"type":"string"},"type":{"type":"string"},"market":{"type":"string"}},"required":["ticker","type"]}},"weather":{"type":"array","items":{"type":"object","properties":{"location":{"type":"string"},"start":{"type":"string"},"duration":{"type":"integer"}},"required":["location"]}},"sports":{"type":"array","items":{"type":"object","properties":{"fn":{"type":"string","enum":["schedule","standings"]},"league":{"type":"string"},"team":{"type":"string"},"date_from":{"type":"string"},"date_to":{"type":"string"},"num_games":{"type":"integer"}},"required":["fn","league"]}},"time":{"type":"array","items":{"type":"object","properties":{"utc_offset":{"type":"string"}},"required":["utc_offset"]}},"response_length":{"type":"string","enum":["short","medium","long"]}},"additionalProperties":false}`))
 }
-func (t *webTool) Risk(arguments string) Risk {
-	var operations map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(arguments), &operations); err != nil {
-		return RiskNetwork
+
+func webDefinitionWithLimits(result provider.ToolDefinition) provider.ToolDefinition {
+	var schema map[string]any
+	if json.Unmarshal(result.Parameters, &schema) != nil {
+		return result
 	}
-	requiresNetwork := false
-	for name := range operations {
-		if name != "time" && name != "response_length" {
-			requiresNetwork = true
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return result
+	}
+	limits := map[string]int{
+		"search_query": 4, "image_query": 4, "open": 8, "click": 8, "find": 8,
+		"screenshot": maxWebResultImages, "finance": 8, "weather": 8, "sports": 8, "time": 8,
+	}
+	for name, limit := range limits {
+		if property, exists := properties[name].(map[string]any); exists {
+			property["maxItems"] = limit
 		}
 	}
-	if !requiresNetwork || t.argumentsAllowed(arguments) {
+	for _, name := range []string{"search_query", "image_query"} {
+		property, _ := properties[name].(map[string]any)
+		items, _ := property["items"].(map[string]any)
+		itemProperties, _ := items["properties"].(map[string]any)
+		domains, _ := itemProperties["domains"].(map[string]any)
+		if domains != nil {
+			domains["maxItems"] = 20
+		}
+	}
+	if encoded, err := json.Marshal(schema); err == nil {
+		result.Parameters = encoded
+	}
+	return result
+}
+func (t *webTool) Risk(arguments string) Risk {
+	endpoints, err := t.requiredNetworkEndpoints(arguments)
+	if err != nil {
+		return RiskNetwork
+	}
+	var input webInput
+	if json.Unmarshal([]byte(arguments), &input) != nil {
+		return RiskNetwork
+	}
+	if len(endpoints) == 0 {
+		if len(input.Screenshot) > 0 {
+			return RiskExecute
+		}
 		return RiskRead
+	}
+	allowed := t.endpointsAllowed(endpoints)
+	if allowed && len(input.Screenshot) == 0 {
+		return RiskRead
+	}
+	if allowed {
+		return RiskExecute
 	}
 	return RiskNetwork
 }
 
-func (t *webTool) argumentsAllowed(arguments string) bool {
-	if t.permissions == nil {
-		return false
+func (t *webTool) PermissionRequest(arguments string) (permission.Request, error) {
+	endpoints, err := t.requiredNetworkEndpoints(arguments)
+	if err != nil {
+		return permission.Request{}, err
 	}
-	if t.permissions.AllowsUnrestrictedNetwork() {
-		return true
+	if len(endpoints) == 0 {
+		return permission.Request{}, nil
 	}
-	var input webInput
-	if json.Unmarshal([]byte(arguments), &input) != nil {
-		return false
-	}
-	allowedDomains := func(domains []string) bool {
-		if len(domains) == 0 {
-			return false
+	profile := permission.Profile{}
+	seenDomains := make(map[string]struct{})
+	seenProtocols := make(map[string]struct{})
+	for _, endpoint := range endpoints {
+		parsed, parseErr := url.Parse(endpoint)
+		if parseErr != nil || parsed.Hostname() == "" || !slicesContains([]string{"http", "https"}, parsed.Scheme) {
+			return permission.Request{}, fmt.Errorf("invalid web endpoint %q", endpoint)
 		}
-		for _, domain := range domains {
-			if !t.permissions.AllowsNetwork("https", domain) {
-				return false
-			}
+		if _, exists := seenDomains[parsed.Hostname()]; !exists {
+			profile.Network.Domains = append(profile.Network.Domains, parsed.Hostname())
+			seenDomains[parsed.Hostname()] = struct{}{}
 		}
-		return true
-	}
-	for _, query := range input.Search {
-		if !allowedDomains(query.Domains) {
-			return false
+		if _, exists := seenProtocols[parsed.Scheme]; !exists {
+			profile.Network.Protocols = append(profile.Network.Protocols, parsed.Scheme)
+			seenProtocols[parsed.Scheme] = struct{}{}
 		}
 	}
-	for _, query := range input.Images {
-		if !allowedDomains(query.Domains) {
-			return false
-		}
+	sort.Strings(profile.Network.Domains)
+	sort.Strings(profile.Network.Protocols)
+	return permission.Request{Reason: "access the requested web endpoints", Permissions: profile}, nil
+}
+
+func (t *webTool) requiredNetworkEndpoints(arguments string) ([]string, error) {
+	input, err := decodeWebInput(arguments)
+	if err != nil {
+		return nil, err
+	}
+	var endpoints []string
+	for range input.Search {
+		endpoints = append(endpoints, duckDuckGoEndpoint)
+	}
+	for range input.Images {
+		endpoints = append(endpoints, bingImagesEndpoint)
 	}
 	for _, request := range input.Open {
 		target := request.RefID
 		if page, ok := t.lookup(target); ok {
+			if page.Body != "" {
+				continue
+			}
 			target = page.URL
 		}
-		if !t.permissions.AllowsURL(target) {
+		endpoints = append(endpoints, target)
+	}
+	for _, request := range input.Click {
+		page, ok := t.lookup(request.RefID)
+		if !ok {
+			return nil, fmt.Errorf("unknown ref_id %q", request.RefID)
+		}
+		if request.ID < 0 || request.ID >= len(page.Links) {
+			return nil, errors.New("link id is out of range")
+		}
+		endpoints = append(endpoints, page.Links[request.ID])
+	}
+	for range input.Finance {
+		endpoints = append(endpoints, yahooFinanceEndpoint)
+	}
+	for range input.WeatherRaw {
+		endpoints = append(endpoints, weatherGeoEndpoint, weatherAPIEndpoint)
+	}
+	for range input.Sports {
+		endpoints = append(endpoints, espnSportsEndpoint)
+	}
+	endpoints = uniqueStrings(endpoints)
+	for _, endpoint := range endpoints {
+		if len(endpoint) > maxWebURLBytes {
+			return nil, fmt.Errorf("web URL exceeds the %d KiB limit", maxWebURLBytes/1024)
+		}
+	}
+	return endpoints, nil
+}
+
+func (t *webTool) endpointsAllowed(endpoints []string) bool {
+	if t.permissions == nil {
+		return false
+	}
+	for _, endpoint := range endpoints {
+		if !t.permissions.AllowsURL(endpoint) {
 			return false
 		}
 	}
-	// Clicks, screenshots, and the built-in finance/weather/sports services
-	// resolve URLs only during execution; keep their normal network approval.
-	return len(input.Click) == 0 && len(input.Screenshot) == 0 && len(input.Finance) == 0 && len(input.WeatherRaw) == 0 && len(input.Sports) == 0
+	return true
 }
 func (*webTool) Summary(arguments string) string { return argumentSummary("access web", arguments) }
 
@@ -192,13 +315,91 @@ type webInput struct {
 	Length string `json:"response_length"`
 }
 
-func (t *webTool) Execute(ctx context.Context, arguments string) (Result, error) {
+func decodeWebInput(arguments string) (webInput, error) {
 	var input webInput
+	if len(arguments) > maxWebArgumentsBytes {
+		return input, fmt.Errorf("web arguments exceed the %d MiB limit", maxWebArgumentsBytes/(1024*1024))
+	}
 	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
-		return Result{}, fmt.Errorf("invalid web arguments: %w", err)
+		return input, fmt.Errorf("invalid web arguments: %w", err)
+	}
+	if err := validateWebInput(input); err != nil {
+		return input, err
+	}
+	return input, nil
+}
+
+func validateWebInput(input webInput) error {
+	limits := []struct {
+		name  string
+		count int
+		limit int
+	}{
+		{"search_query", len(input.Search), 4},
+		{"image_query", len(input.Images), 4},
+		{"open", len(input.Open), 8},
+		{"click", len(input.Click), 8},
+		{"find", len(input.FindRaw), 8},
+		{"screenshot", len(input.Screenshot), maxWebResultImages},
+		{"finance", len(input.Finance), 8},
+		{"weather", len(input.WeatherRaw), 8},
+		{"sports", len(input.Sports), 8},
+		{"time", len(input.Time), 8},
+	}
+	total := 0
+	for _, item := range limits {
+		if item.count > item.limit {
+			return fmt.Errorf("web %s supports at most %d operations per call", item.name, item.limit)
+		}
+		total += item.count
+	}
+	if total > maxWebOperations {
+		return fmt.Errorf("web call exceeds the %d-operation total limit", maxWebOperations)
+	}
+	for _, query := range input.Search {
+		if len(query.Domains) > 20 {
+			return errors.New("web search_query supports at most 20 domain filters")
+		}
+	}
+	for _, query := range input.Images {
+		if len(query.Domains) > 20 {
+			return errors.New("web image_query supports at most 20 domain filters")
+		}
+	}
+	for _, request := range input.Screenshot {
+		if request.Page < 0 {
+			return errors.New("web screenshot pageno must be non-negative")
+		}
+	}
+	return nil
+}
+
+func publicWebIP(ip net.IP) bool {
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsMulticast() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		// RFC 6598 shared address space and the benchmarking range are not
+		// publicly routable, but Go intentionally classifies them as global
+		// unicast rather than private.
+		if ipv4[0] == 100 && ipv4[1]&0xc0 == 0x40 {
+			return false
+		}
+		if ipv4[0] == 198 && (ipv4[1] == 18 || ipv4[1] == 19) {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *webTool) Execute(ctx context.Context, arguments string) (Result, error) {
+	input, err := decodeWebInput(arguments)
+	if err != nil {
+		return Result{}, err
 	}
 	var results []any
 	var images []provider.Image
+	var imageBytes int64
 	for _, query := range input.Search {
 		value, err := t.search(ctx, query.Q, query.Domains, query.Recency, false)
 		results = append(results, outcome("search_query", value, err))
@@ -220,9 +421,14 @@ func (t *webTool) Execute(ctx context.Context, arguments string) (Result, error)
 		results = append(results, outcome("find", value, err))
 	}
 	for _, request := range input.Screenshot {
-		value, image, err := t.screenshot(ctx, request.RefID, request.Page)
+		value, image, rawBytes, err := t.screenshot(ctx, request.RefID, request.Page, maxWebResultImageRaw-imageBytes)
 		if image != nil {
-			images = append(images, *image)
+			if len(images) >= maxWebResultImages || rawBytes > maxWebResultImageRaw-imageBytes {
+				err = fmt.Errorf("web result images exceed the %d MiB total limit", maxWebResultImageRaw/(1024*1024))
+			} else {
+				images = append(images, *image)
+				imageBytes += rawBytes
+			}
 		}
 		results = append(results, outcome("screenshot", value, err))
 	}
@@ -281,6 +487,9 @@ func (t *webTool) search(ctx context.Context, query string, domains []string, re
 		items := []any{}
 		for _, match := range matches {
 			target := html.UnescapeString(match[1])
+			if len(target) > maxWebURLBytes {
+				continue
+			}
 			ref := t.store(webPage{URL: target})
 			items = append(items, map[string]any{"ref_id": ref, "image_url": target})
 		}
@@ -290,7 +499,7 @@ func (t *webTool) search(ctx context.Context, query string, domains []string, re
 		return items, nil
 	}
 	items := []any{}
-	for _, match := range anchorPattern.FindAllStringSubmatch(page.Body, -1) {
+	for _, match := range anchorPattern.FindAllStringSubmatch(page.Body, maxCachedPageLinks) {
 		target := html.UnescapeString(match[1])
 		title := strings.TrimSpace(plainText(match[2]))
 		if title == "" || strings.HasPrefix(target, "/") {
@@ -300,6 +509,9 @@ func (t *webTool) search(ctx context.Context, query string, domains []string, re
 			if redirected := parsed.Query().Get("uddg"); redirected != "" {
 				target = redirected
 			}
+		}
+		if len(target) > maxWebURLBytes {
+			continue
 		}
 		ref := t.store(webPage{URL: target})
 		items = append(items, map[string]any{"ref_id": ref, "title": title, "url": target})
@@ -350,20 +562,35 @@ func (t *webTool) find(reference, pattern string) (any, error) {
 		return nil, errors.New("unknown ref_id")
 	}
 	text := plainText(page.Body)
-	lower, needle := strings.ToLower(text), strings.ToLower(pattern)
-	index := strings.Index(lower, needle)
-	if index < 0 {
+	matcher, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(pattern))
+	if err != nil {
+		return nil, fmt.Errorf("compile find pattern: %w", err)
+	}
+	match := matcher.FindStringIndex(text)
+	if match == nil {
 		return map[string]any{"found": false}, nil
 	}
-	start := max(0, index-300)
-	end := min(len(text), index+len(pattern)+500)
+	start := max(0, match[0]-300)
+	end := min(len(text), match[1]+500)
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	for end > start && end < len(text) && !utf8.RuneStart(text[end]) {
+		end--
+	}
 	return map[string]any{"found": true, "excerpt": text[start:end]}, nil
 }
 
 func (t *webTool) fetch(ctx context.Context, target string) (webPage, error) {
+	if len(target) > maxWebURLBytes {
+		return webPage{}, fmt.Errorf("web URL exceeds the %d KiB limit", maxWebURLBytes/1024)
+	}
 	parsed, err := url.Parse(target)
 	if err != nil || !slicesContains([]string{"http", "https"}, parsed.Scheme) {
 		return webPage{}, errors.New("only http and https URLs are supported")
+	}
+	if t.permissions == nil || !t.permissions.AllowsURL(target) {
+		return webPage{}, fmt.Errorf("web endpoint is not authorized: %s://%s", parsed.Scheme, parsed.Hostname())
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -386,31 +613,71 @@ func (t *webTool) fetch(ctx context.Context, target string) (webPage, error) {
 		return webPage{}, errors.New("web response exceeds 4 MiB")
 	}
 	page := webPage{URL: response.Request.URL.String(), Body: string(data), ContentType: response.Header.Get("Content-Type")}
-	for _, match := range anchorPattern.FindAllStringSubmatch(page.Body, -1) {
+	linkBytes := 0
+	for _, match := range anchorPattern.FindAllStringSubmatch(page.Body, maxCachedPageLinks) {
 		link := html.UnescapeString(match[1])
 		resolved, err := response.Request.URL.Parse(link)
 		if err == nil {
-			page.Links = append(page.Links, resolved.String())
+			value := resolved.String()
+			if len(value) > maxWebURLBytes || linkBytes+len(value) > maxCachedLinkBytes {
+				continue
+			}
+			linkBytes += len(value)
+			page.Links = append(page.Links, value)
 		}
 	}
 	return page, nil
+}
+
+func (t *webTool) checkRedirect(request *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(request.URL.String()) > maxWebURLBytes {
+		return fmt.Errorf("redirect URL exceeds the %d KiB limit", maxWebURLBytes/1024)
+	}
+	if t.permissions == nil || !t.permissions.AllowsURL(request.URL.String()) {
+		return fmt.Errorf("redirect endpoint is not authorized: %s://%s", request.URL.Scheme, request.URL.Hostname())
+	}
+	return nil
 }
 func (t *webTool) store(page webPage) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.next++
 	id := "web" + strconv.Itoa(t.next)
-	t.pages[id] = page
-	if len(t.pages) > 128 {
-		delete(t.pages, "web"+strconv.Itoa(t.next-128))
+	entry := &webCacheEntry{id: id, page: page, bytes: webPageBytes(page)}
+	entry.element = t.recent.PushFront(entry)
+	t.pages[id] = entry
+	t.cacheBytes += entry.bytes
+	for t.cacheBytes > t.cacheLimit && t.recent.Len() > 1 {
+		oldest := t.recent.Back()
+		candidate := oldest.Value.(*webCacheEntry)
+		delete(t.pages, candidate.id)
+		t.recent.Remove(oldest)
+		t.cacheBytes -= candidate.bytes
 	}
 	return id
 }
 func (t *webTool) lookup(id string) (webPage, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	page, ok := t.pages[id]
-	return page, ok
+	entry, ok := t.pages[id]
+	if !ok {
+		return webPage{}, false
+	}
+	t.recent.MoveToFront(entry.element)
+	return entry.page, true
+}
+
+func webPageBytes(page webPage) int64 {
+	// Include a conservative fixed charge for map/list/string headers in
+	// addition to payload bytes so many URL-only search references stay bounded.
+	result := int64(128 + len(page.URL) + len(page.Body) + len(page.ContentType))
+	for _, link := range page.Links {
+		result += int64(16 + len(link))
+	}
+	return result
 }
 
 func (t *webTool) finance(ctx context.Context, ticker, kind, market string) (any, error) {
@@ -526,34 +793,54 @@ func timeAtOffset(offset string) (any, error) {
 	return map[string]any{"utc_offset": offset, "datetime": now.Format(time.RFC3339)}, nil
 }
 
-func (t *webTool) screenshot(ctx context.Context, reference string, pageNumber int) (any, *provider.Image, error) {
+func (t *webTool) screenshot(ctx context.Context, reference string, pageNumber int, maximumBytes int64) (any, *provider.Image, int64, error) {
+	if pageNumber < 0 {
+		return nil, nil, 0, errors.New("screenshot pageno must be non-negative")
+	}
 	page, ok := t.lookup(reference)
 	if !ok {
-		return nil, nil, errors.New("unknown ref_id")
+		return nil, nil, 0, errors.New("unknown ref_id")
 	}
 	if !strings.Contains(strings.ToLower(page.ContentType), "pdf") && !strings.HasPrefix(page.Body, "%PDF") {
-		return nil, nil, errors.New("screenshot currently supports PDF references")
+		return nil, nil, 0, errors.New("screenshot currently supports PDF references")
 	}
 	directory, err := os.MkdirTemp("", "supercode-pdf-*")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer os.RemoveAll(directory)
 	input := directory + "/input.pdf"
 	if err := os.WriteFile(input, []byte(page.Body), 0o600); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	prefix := directory + "/page"
-	command := exec.CommandContext(ctx, "pdftoppm", "-f", strconv.Itoa(pageNumber+1), "-l", strconv.Itoa(pageNumber+1), "-singlefile", "-png", input, prefix)
-	if output, err := command.CombinedOutput(); err != nil {
-		return nil, nil, fmt.Errorf("render PDF page: %w: %s", err, output)
+	renderContext, cancel := context.WithTimeout(ctx, webScreenshotTimeout)
+	defer cancel()
+	command := exec.CommandContext(renderContext, "pdftoppm", "-f", strconv.Itoa(pageNumber+1), "-l", strconv.Itoa(pageNumber+1), "-singlefile", "-scale-to", strconv.Itoa(maxWebScreenshotSide), "-png", input, prefix)
+	configureProcessTree(command, false)
+	command.WaitDelay = time.Second
+	defer cleanupProcessTree(command)
+	var output limitedBuffer
+	command.Stdout, command.Stderr = &output, &output
+	if err := command.Run(); err != nil {
+		if errors.Is(renderContext.Err(), context.DeadlineExceeded) {
+			return nil, nil, 0, fmt.Errorf("render PDF page timed out after %s", webScreenshotTimeout)
+		}
+		return nil, nil, 0, fmt.Errorf("render PDF page: %w: %s", err, output.String())
 	}
-	data, err := os.ReadFile(prefix + ".png")
+	path := prefix + ".png"
+	info, err := os.Stat(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	image := provider.Image{MIMEType: "image/png", Data: base64.StdEncoding.EncodeToString(data), Detail: "high"}
-	return map[string]any{"ref_id": reference, "pageno": pageNumber, "bytes": len(data)}, &image, nil
+	if maximumBytes < 0 || info.Size() > maximumBytes {
+		return nil, nil, 0, fmt.Errorf("web result images exceed the %d MiB total limit", maxWebResultImageRaw/(1024*1024))
+	}
+	image, err := attachment.Load(path, "high")
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return map[string]any{"ref_id": reference, "pageno": pageNumber, "bytes": info.Size()}, &image, info.Size(), nil
 }
 func plainText(value string) string {
 	value = tagPattern.ReplaceAllString(value, "\n")
@@ -585,6 +872,19 @@ func slicesContains(values []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func truncateWebResponse(value, length string) string {

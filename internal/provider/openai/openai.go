@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	sdk "github.com/openai/openai-go/v3"
@@ -25,13 +26,23 @@ type Config struct {
 	APIKey     string
 	BaseURL    string
 	MaxRetries int
+	Headers    map[string]string
 }
 
 // Provider implements provider.Provider with the OpenAI Chat Completions API.
 type Provider struct {
-	client sdk.Client
-	secret string
+	client  sdk.Client
+	secrets []string
 }
+
+const (
+	maxResponseTextBytes  = 16 * 1024 * 1024
+	maxResponseToolCalls  = 64
+	maxToolCallNameBytes  = 256
+	maxToolCallIDBytes    = 1024
+	maxToolCallArgsBytes  = 1024 * 1024
+	maxTotalToolArgsBytes = 8 * 1024 * 1024
+)
 
 type responseStream struct {
 	stream            *ssestream.Stream[sdk.ChatCompletionChunk]
@@ -39,8 +50,17 @@ type responseStream struct {
 	response          provider.Response
 	err               error
 	emittedCompletion bool
-	toolCallsByIndex  map[int64]*provider.ToolCall
-	secret            string
+	toolCallsByIndex  map[int64]*streamToolCall
+	text              strings.Builder
+	totalToolArgs     int
+	terminal          bool
+	secrets           []string
+}
+
+type streamToolCall struct {
+	id        string
+	name      strings.Builder
+	arguments strings.Builder
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -53,7 +73,9 @@ func New(config Config) (*Provider, error) {
 		return nil, ErrMissingAPIKey
 	}
 
-	options := []option.RequestOption{option.WithAPIKey(apiKey)}
+	httpClient := provider.SecureHTTPClient(nil)
+	options := []option.RequestOption{option.WithAPIKey(apiKey), option.WithHTTPClient(httpClient)}
+	secrets := []string{apiKey}
 	if baseURL := strings.TrimSpace(config.BaseURL); baseURL != "" {
 		options = append(options, option.WithBaseURL(baseURL))
 	}
@@ -63,8 +85,16 @@ func New(config Config) (*Provider, error) {
 	if config.MaxRetries == 0 {
 		config.MaxRetries = 2
 	}
+	for name, value := range config.Headers {
+		if strings.TrimSpace(name) != "" {
+			options = append(options, option.WithHeader(name, value))
+			if strings.TrimSpace(value) != "" {
+				secrets = append(secrets, value)
+			}
+		}
+	}
 	options = append(options, option.WithMaxRetries(config.MaxRetries))
-	return &Provider{client: sdk.NewClient(options...), secret: apiKey}, nil
+	return &Provider{client: sdk.NewClient(options...), secrets: secrets}, nil
 }
 
 // Generate maps a provider-neutral request to Chat Completions.
@@ -74,13 +104,22 @@ func (p *Provider) Generate(ctx context.Context, request provider.Request) (prov
 	}
 	completion, err := p.client.Chat.Completions.New(ctx, newChatParams(request))
 	if err != nil {
-		return provider.Response{}, redactedError("openai-compatible chat completions API", err, p.secret)
+		return provider.Response{}, redactedError("openai-compatible chat completions API", err, p.secrets...)
+	}
+	if completion == nil {
+		return provider.Response{}, errors.New("openai-compatible chat completions API returned a null response")
 	}
 	if len(completion.Choices) == 0 {
 		return provider.Response{}, errors.New("openai-compatible chat completions API returned no choices")
 	}
 	choice := completion.Choices[0]
-	toolCalls := mapToolCalls(choice.Message.ToolCalls)
+	if len(choice.Message.Content) > maxResponseTextBytes {
+		return provider.Response{}, fmt.Errorf("openai-compatible response text exceeds the %d MiB limit", maxResponseTextBytes/(1024*1024))
+	}
+	toolCalls, err := mapToolCalls(choice.Message.ToolCalls)
+	if err != nil {
+		return provider.Response{}, err
+	}
 	if choice.Message.Content == "" && len(toolCalls) == 0 {
 		return provider.Response{}, errors.New("openai-compatible chat completions API returned no text")
 	}
@@ -102,8 +141,8 @@ func (p *Provider) Stream(ctx context.Context, request provider.Request) (provid
 	}
 	return &responseStream{
 		stream:           p.client.Chat.Completions.NewStreaming(ctx, newChatParams(request)),
-		toolCallsByIndex: make(map[int64]*provider.ToolCall),
-		secret:           p.secret,
+		toolCallsByIndex: make(map[int64]*streamToolCall),
+		secrets:          append([]string(nil), p.secrets...),
 	}, nil
 }
 
@@ -212,18 +251,26 @@ func defaultImageDetail(detail string) string {
 	return detail
 }
 
-func mapToolCalls(calls []sdk.ChatCompletionMessageToolCallUnion) []provider.ToolCall {
+func mapToolCalls(calls []sdk.ChatCompletionMessageToolCallUnion) ([]provider.ToolCall, error) {
+	if len(calls) > maxResponseToolCalls {
+		return nil, fmt.Errorf("openai-compatible response exceeds the %d tool-call limit", maxResponseToolCalls)
+	}
 	result := make([]provider.ToolCall, 0, len(calls))
+	totalArguments := 0
 	for _, call := range calls {
 		function := call.AsFunction()
 		if function.ID == "" || function.Function.Name == "" {
 			continue
 		}
+		if len(function.ID) > maxToolCallIDBytes || len(function.Function.Name) > maxToolCallNameBytes || len(function.Function.Arguments) > maxToolCallArgsBytes || len(function.Function.Arguments) > maxTotalToolArgsBytes-totalArguments {
+			return nil, errors.New("openai-compatible response tool call exceeds configured size limits")
+		}
+		totalArguments += len(function.Function.Arguments)
 		result = append(result, provider.ToolCall{
 			ID: function.ID, Name: function.Function.Name, Arguments: function.Function.Arguments,
 		})
 	}
-	return result
+	return result, nil
 }
 
 func mapUsage(usage sdk.CompletionUsage) provider.Usage {
@@ -250,27 +297,56 @@ func (s *responseStream) Next() bool {
 		}
 
 		for _, choice := range chunk.Choices {
+			if choice.Index != 0 {
+				continue
+			}
 			if choice.FinishReason != "" {
 				s.response.FinishReason = choice.FinishReason
+				s.terminal = true
 			}
 			for _, deltaCall := range choice.Delta.ToolCalls {
+				if deltaCall.Index < 0 || deltaCall.Index >= maxResponseToolCalls {
+					s.err = errors.New("openai-compatible stream returned an invalid tool-call index")
+					return false
+				}
 				call := s.toolCallsByIndex[deltaCall.Index]
 				if call == nil {
-					call = &provider.ToolCall{}
+					if len(s.toolCallsByIndex) >= maxResponseToolCalls {
+						s.err = fmt.Errorf("openai-compatible stream exceeds the %d tool-call limit", maxResponseToolCalls)
+						return false
+					}
+					call = &streamToolCall{}
 					s.toolCallsByIndex[deltaCall.Index] = call
 				}
 				if deltaCall.ID != "" {
-					call.ID = deltaCall.ID
+					if len(deltaCall.ID) > maxToolCallIDBytes {
+						s.err = errors.New("openai-compatible stream tool-call ID is too large")
+						return false
+					}
+					call.id = deltaCall.ID
 				}
 				if deltaCall.Function.Name != "" {
-					call.Name += deltaCall.Function.Name
+					if call.name.Len()+len(deltaCall.Function.Name) > maxToolCallNameBytes {
+						s.err = errors.New("openai-compatible stream tool-call name is too large")
+						return false
+					}
+					call.name.WriteString(deltaCall.Function.Name)
 				}
-				call.Arguments += deltaCall.Function.Arguments
+				if len(deltaCall.Function.Arguments) > maxToolCallArgsBytes-call.arguments.Len() || len(deltaCall.Function.Arguments) > maxTotalToolArgsBytes-s.totalToolArgs {
+					s.err = errors.New("openai-compatible stream tool-call arguments are too large")
+					return false
+				}
+				call.arguments.WriteString(deltaCall.Function.Arguments)
+				s.totalToolArgs += len(deltaCall.Function.Arguments)
 			}
 			if choice.Delta.Content == "" {
 				continue
 			}
-			s.response.Text += choice.Delta.Content
+			if len(choice.Delta.Content) > maxResponseTextBytes-s.text.Len() {
+				s.err = fmt.Errorf("openai-compatible stream text exceeds the %d MiB limit", maxResponseTextBytes/(1024*1024))
+				return false
+			}
+			s.text.WriteString(choice.Delta.Content)
 			s.current = provider.StreamEvent{
 				Type:  provider.StreamEventTextDelta,
 				Delta: choice.Delta.Content,
@@ -280,14 +356,31 @@ func (s *responseStream) Next() bool {
 	}
 
 	if err := s.stream.Err(); err != nil {
-		s.err = redactedError("openai-compatible chat completions stream", err, s.secret)
+		s.err = redactedError("openai-compatible chat completions stream", err, s.secrets...)
 		return false
 	}
-	for index := int64(0); index < int64(len(s.toolCallsByIndex)); index++ {
-		if call := s.toolCallsByIndex[index]; call != nil {
-			s.response.ToolCalls = append(s.response.ToolCalls, *call)
-		}
+	if !s.terminal {
+		s.err = errors.New("openai-compatible chat completions stream ended before a finish reason")
+		return false
 	}
+	indices := make([]int, 0, len(s.toolCallsByIndex))
+	for index := range s.toolCallsByIndex {
+		indices = append(indices, int(index))
+	}
+	sort.Ints(indices)
+	for expected, index := range indices {
+		if index != expected {
+			s.err = errors.New("openai-compatible stream returned non-contiguous tool-call indexes")
+			return false
+		}
+		call := s.toolCallsByIndex[int64(index)]
+		if call == nil || call.id == "" || call.name.Len() == 0 {
+			s.err = errors.New("openai-compatible stream returned an incomplete tool call")
+			return false
+		}
+		s.response.ToolCalls = append(s.response.ToolCalls, provider.ToolCall{ID: call.id, Name: call.name.String(), Arguments: call.arguments.String()})
+	}
+	s.response.Text = s.text.String()
 	if s.response.Text == "" && len(s.response.ToolCalls) == 0 {
 		s.err = errors.New("openai-compatible chat completions stream returned no text")
 		return false
@@ -303,13 +396,7 @@ func (s *responseStream) Next() bool {
 }
 
 func redactedError(prefix string, err error, secrets ...string) error {
-	message := err.Error()
-	for _, secret := range secrets {
-		if strings.TrimSpace(secret) != "" {
-			message = strings.ReplaceAll(message, secret, "[REDACTED]")
-		}
-	}
-	return fmt.Errorf("%s: %s", prefix, message)
+	return provider.RedactedError(prefix, err, secrets...)
 }
 
 func (s *responseStream) Current() provider.StreamEvent {

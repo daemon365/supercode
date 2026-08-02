@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +32,7 @@ type compiledHook struct {
 	command []string
 	timeout time.Duration
 	matcher *regexp.Regexp
+	sha256  string
 }
 
 func New(workspace string, definitions map[string][]config.Hook) (*Manager, error) {
@@ -63,22 +65,22 @@ func New(workspace string, definitions map[string][]config.Hook) (*Manager, erro
 				}
 				matcher = parsed
 			}
-			if strings.TrimSpace(value.SHA256) != "" {
-				path := value.Command[0]
-				if !filepath.IsAbs(path) {
-					path = filepath.Join(workspace, path)
-				}
-				content, err := os.ReadFile(path)
+			command := append([]string(nil), value.Command...)
+			expectedDigest := strings.TrimSpace(value.SHA256)
+			if expectedDigest != "" {
+				executable, err := resolvePinnedExecutable(workspace, command[0])
 				if err != nil {
-					return nil, fmt.Errorf("read trusted hook %s: %w", path, err)
+					return nil, err
 				}
-				digest := sha256.Sum256(content)
-				if !strings.EqualFold(strings.TrimSpace(value.SHA256), hex.EncodeToString(digest[:])) {
-					return nil, fmt.Errorf("hook %s changed since it was trusted; review it and update sha256", path)
+				if err := verifyExecutableDigest(executable, expectedDigest); err != nil {
+					return nil, err
 				}
+				// Execute the exact path that was hashed. A bare command name must
+				// never be resolved through PATH after a different file was pinned.
+				command[0] = executable
 			}
 			manager.hooks[event] = append(manager.hooks[event], compiledHook{
-				command: append([]string(nil), value.Command...), timeout: timeout, matcher: matcher,
+				command: command, timeout: timeout, matcher: matcher, sha256: expectedDigest,
 			})
 		}
 	}
@@ -99,6 +101,15 @@ func (m *Manager) Run(ctx context.Context, event agent.HookEvent, input agent.Ho
 		if item.matcher != nil && !item.matcher.MatchString(hookSubject(input)) {
 			continue
 		}
+		commandPath := item.command[0]
+		cleanupCommand := func() {}
+		if item.sha256 != "" {
+			var stageErr error
+			commandPath, cleanupCommand, stageErr = stageVerifiedExecutable(item.command[0], item.sha256)
+			if stageErr != nil {
+				return result, stageErr
+			}
+		}
 		payload := struct {
 			Event     agent.HookEvent `json:"event"`
 			Workspace string          `json:"workspace"`
@@ -106,7 +117,10 @@ func (m *Manager) Run(ctx context.Context, event agent.HookEvent, input agent.Ho
 		}{Event: event, Workspace: m.workspace, Input: input}
 		encoded, _ := json.Marshal(payload)
 		commandContext, cancel := context.WithTimeout(ctx, item.timeout)
-		command := exec.CommandContext(commandContext, item.command[0], item.command[1:]...)
+		command := exec.CommandContext(commandContext, commandPath, item.command[1:]...)
+		command.Args[0] = item.command[0]
+		configureHookCommand(command)
+		command.WaitDelay = time.Second
 		command.Dir = m.workspace
 		command.Env = append(os.Environ(), "SUPERCODE_HOOK_EVENT="+string(event), "SUPERCODE_WORKSPACE="+m.workspace)
 		command.Stdin = bytes.NewReader(encoded)
@@ -114,8 +128,13 @@ func (m *Manager) Run(ctx context.Context, event agent.HookEvent, input agent.Ho
 		stdout.limit, stderr.limit = maxHookOutput, 8*1024
 		command.Stdout, command.Stderr = &stdout, &stderr
 		err := command.Run()
+		cleanupHookCommand(command)
 		timedOut := errors.Is(commandContext.Err(), context.DeadlineExceeded)
 		cancel()
+		cleanupCommand()
+		if stdout.truncated {
+			return result, fmt.Errorf("%s hook output exceeded %d bytes", event, maxHookOutput)
+		}
 		if err != nil {
 			message := strings.TrimSpace(stderr.String())
 			if timedOut {
@@ -174,21 +193,26 @@ func mergeOutput(target *agent.HookOutput, value agent.HookOutput) {
 }
 
 type boundedBuffer struct {
-	bytes.Buffer
-	limit int
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
 }
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
 	original := len(value)
-	remaining := b.limit - b.Len()
+	remaining := b.limit - b.buffer.Len()
 	if remaining > len(value) {
 		remaining = len(value)
 	}
 	if remaining > 0 {
-		_, _ = b.Buffer.Write(value[:remaining])
+		_, _ = b.buffer.Write(value[:remaining])
 	}
+	b.truncated = b.truncated || remaining < original
 	return original, nil
 }
+
+func (b *boundedBuffer) Len() int       { return b.buffer.Len() }
+func (b *boundedBuffer) String() string { return b.buffer.String() }
 
 // ResolveCommand is used by diagnostics and tests to show the exact executable
 // without executing it.
@@ -197,4 +221,89 @@ func ResolveCommand(workspace string, command []string) string {
 		return strings.Join(command, " ")
 	}
 	return strings.Join(append([]string{filepath.Join(workspace, command[0])}, command[1:]...), " ")
+}
+
+func resolvePinnedExecutable(workspace, executable string) (string, error) {
+	path := strings.TrimSpace(executable)
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(workspace, path)
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(path))
+	if err != nil {
+		return "", fmt.Errorf("resolve trusted hook %s: %w", path, err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("stat trusted hook %s: %w", resolved, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("trusted hook %s is not a regular file", resolved)
+	}
+	return resolved, nil
+}
+
+func verifyExecutableDigest(path, expected string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("read trusted hook %s: %w", path, err)
+	}
+	hasher := sha256.New()
+	_, readErr := io.Copy(hasher, file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return fmt.Errorf("read trusted hook %s: %w", path, readErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close trusted hook %s: %w", path, closeErr)
+	}
+	if !strings.EqualFold(strings.TrimSpace(expected), hex.EncodeToString(hasher.Sum(nil))) {
+		return fmt.Errorf("hook %s changed since it was trusted; review it and update sha256", path)
+	}
+	return nil
+}
+
+// stageVerifiedExecutable copies the exact bytes that were hashed into a
+// private path and executes that copy. This closes the verify-then-exec rename
+// race where a workspace file could otherwise be replaced after verification.
+func stageVerifiedExecutable(path, expected string) (string, func(), error) {
+	source, err := os.Open(path)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("read trusted hook %s: %w", path, err)
+	}
+	info, err := source.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		_ = source.Close()
+		if err != nil {
+			return "", func() {}, fmt.Errorf("stat trusted hook %s: %w", path, err)
+		}
+		return "", func() {}, fmt.Errorf("trusted hook %s is not a regular file", path)
+	}
+	directory, err := os.MkdirTemp("", "supercode-hook-*")
+	if err != nil {
+		_ = source.Close()
+		return "", func() {}, fmt.Errorf("stage trusted hook %s: %w", path, err)
+	}
+	cleanup := func() { _ = os.RemoveAll(directory) }
+	destinationPath := filepath.Join(directory, filepath.Base(path))
+	destination, err := os.OpenFile(destinationPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		_ = source.Close()
+		cleanup()
+		return "", func() {}, fmt.Errorf("stage trusted hook %s: %w", path, err)
+	}
+	hasher := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(destination, hasher), source)
+	sourceCloseErr := source.Close()
+	chmodErr := destination.Chmod(info.Mode().Perm())
+	syncErr := destination.Sync()
+	destinationCloseErr := destination.Close()
+	if err := errors.Join(copyErr, sourceCloseErr, chmodErr, syncErr, destinationCloseErr); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("stage trusted hook %s: %w", path, err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(expected), hex.EncodeToString(hasher.Sum(nil))) {
+		cleanup()
+		return "", func() {}, fmt.Errorf("hook %s changed since it was trusted; review it and update sha256", path)
+	}
+	return destinationPath, cleanup, nil
 }

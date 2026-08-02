@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 
@@ -21,6 +23,11 @@ import (
 	"github.com/daemon365/supercode/internal/skill"
 	"github.com/daemon365/supercode/internal/taskstate"
 	terminalUI "github.com/daemon365/supercode/internal/tui"
+)
+
+const (
+	maxPromptBytes       = 8 * 1024 * 1024
+	maxOutputSchemaBytes = 1024 * 1024
 )
 
 type executionContext struct {
@@ -58,7 +65,7 @@ func executeInvocation(ctx context.Context, execution executionContext) error {
 	}
 	if options.chat {
 		return runAgentChat(
-			ctx, execution.runtime.runner, options, promptArgs, execution.runtime.session,
+			ctx, execution.runtime.runner, execution.runtime.provider, options, promptArgs, execution.runtime.session,
 			execution.stores.sessions, execution.stores.skills, execution.stores.memory,
 			execution.runtime.taskState, execution.runtime.collaboration, turnPrompt,
 			execution.stdin, execution.stdout, execution.stderr, execution.runtime.terminalInput,
@@ -98,6 +105,7 @@ func runTUI(ctx context.Context, execution executionContext, options options, pr
 		GoalAutoContinue:    options.goalAutoContinue,
 		AlternateScreen:     options.alternateScreen,
 		Models:              options.models,
+		ModelInfos:          options.modelInfos,
 		ReasoningEffort:     options.reasoningEffort,
 		ServiceTier:         options.serviceTier,
 		FallbackModels:      options.fallbackModels,
@@ -112,6 +120,7 @@ func runTUI(ctx context.Context, execution executionContext, options options, pr
 		Notification:        fileConfig.Notification,
 		TerminalTitle:       fileConfig.TerminalTitle,
 		OnEvent:             execution.eventLogger,
+		StartupWarnings:     append([]string(nil), execution.runtime.mcpWarnings...),
 	}, execution.stdin, execution.stdout)
 }
 
@@ -143,7 +152,25 @@ func runSingleTurn(
 		turnInstructions, execution.initialImages, options.jsonOutput, execution.stdout, execution.stderr,
 	)
 	if err != nil {
-		return err
+		shutdownErr := shutdownCollaboration(execution.runtime.collaboration)
+		if !options.ephemeral && len(history) > 0 {
+			interrupted := execution.runtime.session
+			interrupted.Messages = history
+			interrupted.Plan, interrupted.Goal = execution.runtime.taskState.Snapshot()
+			interrupted.Agents = execution.runtime.collaboration.Snapshot()
+			if interrupted.Title == "" {
+				interrupted.Title = title(prompt)
+			}
+			commitErr := execution.stores.sessions.Commit(interrupted)
+			shutdownErr = errors.Join(shutdownErr, commitErr)
+			if commitErr == nil {
+				shutdownErr = errors.Join(shutdownErr, runNonTUIMemoryShutdown(execution.stores.memory, execution.runtime.provider, execution.stores.sessions, interrupted.ID, options.modelName))
+			}
+		}
+		return errors.Join(err, shutdownErr)
+	}
+	if err := shutdownCollaboration(execution.runtime.collaboration); err != nil {
+		return fmt.Errorf("stop sub-agents before saving: %w", err)
 	}
 	lastMessage := lastAssistantMessage(history)
 	if err := validateStructuredOutput(resolvedSchema, lastMessage); err != nil {
@@ -164,23 +191,30 @@ func runSingleTurn(
 	if options.ephemeral {
 		return nil
 	}
-	checkpoint := session.Checkpoint{
-		Messages: activeSession.Messages, Plan: activeSession.Plan, Goal: activeSession.Goal,
-		Agents: activeSession.Agents, Title: activeSession.Title,
-	}
-	if err := execution.stores.sessions.Append(activeSession.ID, "checkpoint", checkpoint); err != nil {
+	if err := execution.stores.sessions.Commit(activeSession); err != nil {
 		return err
 	}
-	return execution.stores.sessions.Save(activeSession)
+	return runNonTUIMemoryShutdown(execution.stores.memory, execution.runtime.provider, execution.stores.sessions, activeSession.ID, options.modelName)
 }
 
 func resolveOutputSchema(path, instructions string) (*jsonschema.Resolved, string, error) {
 	if path == "" {
 		return nil, instructions, nil
 	}
-	content, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("read output schema: %w", err)
+		return nil, "", fmt.Errorf("open output schema: %w", err)
+	}
+	content, readErr := io.ReadAll(io.LimitReader(file, maxOutputSchemaBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, "", fmt.Errorf("read output schema: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, "", fmt.Errorf("close output schema: %w", closeErr)
+	}
+	if len(content) > maxOutputSchemaBytes {
+		return nil, "", fmt.Errorf("output schema exceeds the %d-byte limit", maxOutputSchemaBytes)
 	}
 	var schemaValue jsonschema.Schema
 	if err := json.Unmarshal(content, &schemaValue); err != nil {
@@ -211,6 +245,7 @@ func validateStructuredOutput(schema *jsonschema.Resolved, value string) error {
 func runAgentChat(
 	ctx context.Context,
 	runner *agent.Runner,
+	modelProvider provider.Provider,
 	options options,
 	initialPrompt []string,
 	activeSession session.Session,
@@ -224,8 +259,24 @@ func runAgentChat(
 	stdout io.Writer,
 	stderr io.Writer,
 	showPrompts bool,
-) error {
+) (returnErr error) {
 	history := append([]provider.Message(nil), activeSession.Messages...)
+	defer func() {
+		shutdownErr := shutdownCollaboration(collaborationManager)
+		if !options.ephemeral && activeSession.ID != "" {
+			activeSession.Messages = append([]provider.Message(nil), history...)
+			activeSession.Plan, activeSession.Goal = taskState.Snapshot()
+			activeSession.Agents = collaborationManager.Snapshot()
+			commitErr := store.Commit(activeSession)
+			shutdownErr = errors.Join(shutdownErr, commitErr)
+			if commitErr == nil {
+				shutdownErr = errors.Join(shutdownErr, runNonTUIMemoryShutdown(memoryStore, modelProvider, store, activeSession.ID, options.modelName))
+			}
+		}
+		if shutdownErr != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("finalize chat session: %w", shutdownErr))
+		}
+	}()
 	ask := func(prompt string) error {
 		_, _ = memoryStore.AutoCapture(prompt)
 		turnPrompt.Model = options.modelName
@@ -235,27 +286,27 @@ func runAgentChat(
 		turnPrompt.Memory = memoryStore.Instructions()
 		turnPrompt.Goal = goalPrompt(taskState)
 		instructions := prompts.Turn(turnPrompt)
-		if err := store.Append(activeSession.ID, "user_prompt", map[string]string{"content": prompt}); err != nil {
-			return err
+		if !options.ephemeral {
+			if err := store.Append(activeSession.ID, "user_prompt", map[string]string{"content": prompt}); err != nil {
+				return err
+			}
 		}
 		updated, err := executeAgent(ctx, runner, prompt, history, instructions, nil, false, stdout, stderr)
+		if len(updated) > 0 {
+			history, activeSession.Messages = updated, updated
+		}
 		if err != nil {
 			return err
 		}
-		history, activeSession.Messages = updated, updated
 		activeSession.Plan, activeSession.Goal = taskState.Snapshot()
 		activeSession.Agents = collaborationManager.Snapshot()
 		if activeSession.Title == "" {
 			activeSession.Title = title(prompt)
 		}
-		checkpoint := session.Checkpoint{
-			Messages: activeSession.Messages, Plan: activeSession.Plan, Goal: activeSession.Goal,
-			Agents: activeSession.Agents, Title: activeSession.Title,
+		if options.ephemeral {
+			return nil
 		}
-		if err := store.Append(activeSession.ID, "checkpoint", checkpoint); err != nil {
-			return err
-		}
-		return store.Save(activeSession)
+		return store.Commit(activeSession)
 	}
 	if len(initialPrompt) > 0 {
 		if err := ask(strings.TrimSpace(strings.Join(initialPrompt, " "))); err != nil {
@@ -286,12 +337,30 @@ func runAgentChat(
 		case "/exit", "/quit":
 			return nil
 		case "/new":
+			if err := quiesceCollaboration(collaborationManager); err != nil {
+				return fmt.Errorf("stop sub-agents before starting a new session: %w", err)
+			}
+			if !options.ephemeral {
+				activeSession.Messages = append([]provider.Message(nil), history...)
+				activeSession.Plan, activeSession.Goal = taskState.Snapshot()
+				activeSession.Agents = collaborationManager.Snapshot()
+				if err := store.Commit(activeSession); err != nil {
+					return fmt.Errorf("save session before /new: %w", err)
+				}
+			}
+			if err := collaborationManager.Restore(json.RawMessage(`[]`)); err != nil {
+				return fmt.Errorf("clear sub-agents for /new: %w", err)
+			}
 			history = nil
 			taskState.Reset()
-			var err error
-			activeSession, err = store.New(options.workspace, options.modelName)
-			if err != nil {
-				return err
+			if !options.ephemeral {
+				var err error
+				activeSession, err = store.New(options.workspace, options.modelName)
+				if err != nil {
+					return err
+				}
+			} else {
+				activeSession = session.Session{Workspace: options.workspace, Model: options.modelName}
 			}
 			continue
 		}
@@ -304,6 +373,34 @@ func runAgentChat(
 			}
 		}
 	}
+}
+
+func quiesceCollaboration(manager *collaboration.Manager) error {
+	if manager == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return manager.Quiesce(ctx)
+}
+
+func shutdownCollaboration(manager *collaboration.Manager) error {
+	if manager == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return manager.Shutdown(ctx)
+}
+
+func runNonTUIMemoryShutdown(memoryStore *memory.Store, modelProvider provider.Provider, sessions *session.Store, sessionID, modelName string) error {
+	if memoryStore == nil || modelProvider == nil || sessions == nil || sessionID == "" || !memoryStore.Configuration().Generate {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, err := memoryStore.RunShutdown(ctx, modelProvider, sessions, sessionID, modelName)
+	return err
 }
 
 func goalPrompt(state *taskstate.State) string {

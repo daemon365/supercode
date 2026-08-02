@@ -81,9 +81,14 @@ func (s *Store) add(rule Rule) (Rule, error) {
 			return existing, nil
 		}
 	}
+	previous := append([]Rule(nil), s.rules...)
 	s.rules = append(s.rules, rule)
 	sort.SliceStable(s.rules, func(left, right int) bool { return s.rules[left].ID < s.rules[right].ID })
-	return rule, s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.rules = previous
+		return Rule{}, err
+	}
+	return rule, nil
 }
 
 func (s *Store) Remove(id string) (bool, error) {
@@ -93,8 +98,13 @@ func (s *Store) Remove(id string) (bool, error) {
 		if rule.ID != id {
 			continue
 		}
+		previous := append([]Rule(nil), s.rules...)
 		s.rules = append(s.rules[:index], s.rules[index+1:]...)
-		return true, s.saveLocked()
+		if err := s.saveLocked(); err != nil {
+			s.rules = previous
+			return false, err
+		}
+		return true, nil
 	}
 	return false, nil
 }
@@ -225,8 +235,15 @@ func (s *Store) saveLocked() error {
 		temporary.Close()
 		return err
 	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, s.path)
+	if err := os.Rename(temporaryPath, s.path); err != nil {
+		return err
+	}
+	return syncPolicyDirectory(filepath.Dir(s.path))
 }

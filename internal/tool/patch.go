@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var omissionPlaceholderPattern = regexp.MustCompile(`(?i)^\s*(?:(?://|#|/\*+|\*+)\s*)?(?:\[\s*)?(?:(?:content|code|lines?|sections?)\s+(?:omitted|unchanged)|(?:rest|remaining|existing|unchanged|other)\s+(?:content|code|lines?|sections?)\s+(?:omitted|unchanged)|\.\.\.\s*(?:rest|remaining|existing|unchanged|other)\b.*)(?:\s*\])?(?:\s*\*/)?\s*$`)
@@ -117,15 +118,18 @@ func applyUnifiedDiff(ctx context.Context, workspace workspace, diff string) (Re
 		}
 		arguments = append(arguments, "-")
 		command := exec.CommandContext(ctx, "git", arguments...)
+		configureProcessTree(command, false)
+		command.WaitDelay = time.Second
+		defer cleanupProcessTree(command)
 		command.Dir = workspace.root
 		command.Stdin = strings.NewReader(diff)
-		var stderr bytes.Buffer
-		command.Stderr = &stderr
-		output, err := command.Output()
+		var stdout, stderr limitedBuffer
+		command.Stdout, command.Stderr = &stdout, &stderr
+		err := command.Run()
 		if err != nil {
 			return nil, fmt.Errorf("git apply: %w: %s", err, strings.TrimSpace(stderr.String()))
 		}
-		return output, nil
+		return []byte(stdout.String()), nil
 	}
 	if _, err := run(true); err != nil {
 		return Result{}, err

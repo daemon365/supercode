@@ -13,6 +13,7 @@ import (
 	"github.com/daemon365/supercode/internal/agent"
 	"github.com/daemon365/supercode/internal/config"
 	"github.com/daemon365/supercode/internal/modelcatalog"
+	"github.com/daemon365/supercode/internal/provider"
 	"github.com/daemon365/supercode/internal/tool"
 )
 
@@ -49,6 +50,7 @@ type options struct {
 	goalAutoContinue    bool
 	alternateScreen     bool
 	models              []string
+	modelInfos          []provider.ModelInfo
 	modelCatalog        *modelcatalog.Catalog
 	fallbackModels      []string
 	configDiagnostics   bool
@@ -83,9 +85,26 @@ func parseOptionsWithConfig(
 	lookupEnv func(string) (string, bool),
 	fileConfig config.File,
 ) (options, []string, error) {
-	modelDefault := firstNonEmpty(fileConfig.Model, defaultModel)
+	modelInfos := configuredModelInfos(fileConfig.Providers)
+	providerDefault := ""
+	if len(modelInfos) > 0 {
+		providerDefault = modelInfos[0].Selector
+	}
+	modelDefault := firstNonEmpty(fileConfig.Model, providerDefault, defaultModel)
 	modelDefault = envOrDefault(lookupEnv, "OPENAI_MODEL", modelDefault)
-	catalog := modelcatalog.New(append(append([]string{modelDefault}, fileConfig.Models...), fileConfig.FallbackModels...), fileConfig.ModelCatalog)
+	if len(modelInfos) > 0 {
+		var err error
+		modelDefault, err = resolveConfiguredModel(modelDefault, modelInfos)
+		if err != nil {
+			return options{}, nil, err
+		}
+	}
+	configuredNames := append([]string{modelDefault}, fileConfig.Models...)
+	for _, info := range modelInfos {
+		configuredNames = append(configuredNames, info.Selector)
+	}
+	configuredNames = append(configuredNames, fileConfig.FallbackModels...)
+	catalog := modelcatalog.New(configuredNames, expandedModelCatalog(fileConfig.ModelCatalog, modelInfos))
 	baseURLDefault := firstNonEmpty(fileConfig.URL, config.DefaultURL)
 	baseURLDefault = envOrDefault(lookupEnv, "OPENAI_BASE_URL", baseURLDefault)
 	instructionsDefault := envOrDefault(lookupEnv, "SUPERCODE_INSTRUCTIONS", fileConfig.Instructions)
@@ -185,7 +204,7 @@ func parseOptionsWithConfig(
 	command.SetErr(stderr)
 	flags := command.PersistentFlags()
 
-	modelName := flags.StringP("model", "m", modelDefault, "OpenAI model ID")
+	modelName := flags.StringP("model", "m", modelDefault, "model ID or provider/model selector")
 	reasoningEffort := flags.String("reasoning-effort", fileConfig.ReasoningEffort, "reasoning effort: low, medium, high, or xhigh")
 	serviceTier := flags.String("service-tier", fileConfig.ServiceTier, "service tier: auto, default, flex, scale, priority, or fast")
 	instructions := flags.String("instructions", instructionsDefault, "system/developer instructions")
@@ -405,6 +424,13 @@ func parseOptionsWithConfig(
 	if !executed {
 		return options{helpShown: true}, nil, nil
 	}
+	if len(modelInfos) > 0 {
+		resolved, err := resolveConfiguredModel(*modelName, modelInfos)
+		if err != nil {
+			return options{}, nil, err
+		}
+		*modelName = resolved
+	}
 	if flags.Changed("model") {
 		modelContext, modelCompact, modelUsable := catalog.Limits(*modelName, agent.DefaultContextWindowTokens)
 		if !flags.Changed("context-window-tokens") && fileConfig.ContextWindowTokens <= 0 {
@@ -448,6 +474,23 @@ func parseOptionsWithConfig(
 	if err := catalog.Validate(*modelName, *reasoningEffort, *serviceTier); err != nil {
 		return options{}, nil, err
 	}
+	fallbackModels := append([]string(nil), fileConfig.FallbackModels...)
+	if len(modelInfos) > 0 {
+		for index, fallback := range fallbackModels {
+			resolved, resolveErr := resolveConfiguredModel(fallback, modelInfos)
+			if resolveErr != nil {
+				return options{}, nil, fmt.Errorf("fallback_models[%d]: %w", index, resolveErr)
+			}
+			fallbackModels[index] = resolved
+		}
+	}
+	modelNames := append([]string(nil), fileConfig.Models...)
+	if len(modelInfos) > 0 {
+		modelNames = modelNames[:0]
+		for _, info := range modelInfos {
+			modelNames = append(modelNames, info.Selector)
+		}
+	}
 	parsedOptions := options{
 		modelName:           *modelName,
 		reasoningEffort:     strings.TrimSpace(*reasoningEffort),
@@ -478,9 +521,10 @@ func parseOptionsWithConfig(
 		trustProject:        *trustProject,
 		goalAutoContinue:    *goalAutoContinue,
 		alternateScreen:     *alternateScreen && !*noAlternateScreen,
-		models:              append([]string(nil), fileConfig.Models...),
+		models:              modelNames,
+		modelInfos:          append([]provider.ModelInfo(nil), modelInfos...),
 		modelCatalog:        catalog,
-		fallbackModels:      append([]string(nil), fileConfig.FallbackModels...),
+		fallbackModels:      fallbackModels,
 		configDiagnostics:   *configDiagnostics,
 		policyAction:        policyAction,
 		policyValues:        policyValues,
@@ -514,6 +558,64 @@ func parseOptionsWithConfig(
 		parsedOptions.mcpServer = server
 	}
 	return parsedOptions, promptArgs, nil
+}
+
+func configuredModelInfos(configurations []config.ProviderConfig) []provider.ModelInfo {
+	var result []provider.ModelInfo
+	for _, configuration := range configurations {
+		name := strings.TrimSpace(configuration.Name)
+		for _, model := range configuration.Models {
+			model = strings.TrimSpace(model)
+			if name != "" && model != "" {
+				result = append(result, provider.ModelInfo{
+					Selector: provider.ModelSelector(name, model), ID: model, Provider: name,
+				})
+			}
+		}
+	}
+	return result
+}
+
+func resolveConfiguredModel(value string, models []provider.ModelInfo) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", provider.ErrEmptyModel
+	}
+	for _, model := range models {
+		if model.Selector == value {
+			return model.Selector, nil
+		}
+	}
+	match := ""
+	for _, model := range models {
+		if model.ID != value {
+			continue
+		}
+		if match != "" {
+			return "", fmt.Errorf("model %q is configured by multiple providers; use provider/model", value)
+		}
+		match = model.Selector
+	}
+	if match == "" {
+		return "", fmt.Errorf("model %q is not configured by any provider", value)
+	}
+	return match, nil
+}
+
+func expandedModelCatalog(configured map[string]modelcatalog.Capabilities, models []provider.ModelInfo) map[string]modelcatalog.Capabilities {
+	result := make(map[string]modelcatalog.Capabilities, len(configured)+len(models))
+	for name, capabilities := range configured {
+		result[name] = capabilities
+	}
+	for _, model := range models {
+		if _, exists := result[model.Selector]; exists {
+			continue
+		}
+		if capabilities, exists := configured[model.ID]; exists {
+			result[model.Selector] = capabilities
+		}
+	}
+	return result
 }
 
 func approvalCategoryMap(values map[string]bool) map[tool.Category]bool {

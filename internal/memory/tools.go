@@ -63,6 +63,8 @@ func (t *memoryTool) Risk(string) tool.Risk {
 	return tool.RiskRead
 }
 
+func (t *memoryTool) ParallelSafe(string) bool { return t.name != ToolAdd }
+
 func (t *memoryTool) Summary(arguments string) string {
 	switch t.name {
 	case ToolSearch:

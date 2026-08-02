@@ -11,14 +11,33 @@ import (
 func (s *Store) compressEvents(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	source, err := os.Open(s.eventPath(id))
-	if errors.Is(err, os.ErrNotExist) {
+	return withFileLock(s.storeLockPath, func() error {
+		return withFileLock(s.sessionLockPath(id), func() error {
+			return s.compressEventsLocked(id, true)
+		})
+	})
+}
+
+// rotateEventsLocked keeps one compressed previous segment and starts a new
+// active WAL. The snapshot must already contain every sequence in the segment.
+func (s *Store) rotateEventsLocked(id string) error {
+	return s.compressEventsLocked(id, false)
+}
+
+func (s *Store) compressEventsLocked(id string, archive bool) error {
+	plainInfo, plainErr := os.Stat(s.eventPath(id))
+	if errors.Is(plainErr, os.ErrNotExist) {
 		return nil
 	}
-	if err != nil {
-		return err
+	if plainErr != nil {
+		return plainErr
 	}
-	defer source.Close()
+	if plainInfo.Size() < 0 || plainInfo.Size() > maxActiveEventLogBytes {
+		return errEventLogTooLarge
+	}
+	if plainInfo.Size() == 0 && !archive {
+		return nil
+	}
 	temporary, err := os.CreateTemp(s.eventsDirectory, ".events-*.gz.tmp")
 	if err != nil {
 		return err
@@ -30,7 +49,46 @@ func (s *Store) compressEvents(id string) error {
 		return err
 	}
 	writer := gzip.NewWriter(temporary)
-	if _, err := io.Copy(writer, source); err != nil {
+	uncompressedBytes := int64(0)
+	copyPlain := func(path string) error {
+		source, openErr := os.Open(path)
+		if errors.Is(openErr, os.ErrNotExist) {
+			return nil
+		}
+		if openErr != nil {
+			return openErr
+		}
+		defer source.Close()
+		return copyEventDataLimited(writer, source, &uncompressedBytes, maxCompressedEventLogBytes)
+	}
+	copyCompressed := func(path string) error {
+		source, openErr := os.Open(path)
+		if errors.Is(openErr, os.ErrNotExist) {
+			return nil
+		}
+		if openErr != nil {
+			return openErr
+		}
+		reader, openErr := gzip.NewReader(source)
+		if openErr != nil {
+			source.Close()
+			return openErr
+		}
+		copyErr := copyEventDataLimited(writer, reader, &uncompressedBytes, maxCompressedEventLogBytes)
+		closeErr := reader.Close()
+		sourceErr := source.Close()
+		return errors.Join(copyErr, closeErr, sourceErr)
+	}
+	// Archive preserves the previous bounded segment as well. Ordinary rotation
+	// intentionally replaces it so diagnostics and WAL storage remain bounded.
+	if archive {
+		if err := copyCompressed(s.eventGzipPath(id)); err != nil {
+			writer.Close()
+			temporary.Close()
+			return fmt.Errorf("read compressed session events: %w", err)
+		}
+	}
+	if err := copyPlain(s.eventPath(id)); err != nil {
 		writer.Close()
 		temporary.Close()
 		return err
@@ -49,58 +107,27 @@ func (s *Store) compressEvents(id string) error {
 	if err := os.Rename(name, s.eventGzipPath(id)); err != nil {
 		return err
 	}
-	return os.Remove(s.eventPath(id))
+	if err := syncDirectory(s.eventsDirectory); err != nil {
+		return err
+	}
+	if archive {
+		if err := os.Remove(s.eventPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return syncDirectory(s.eventsDirectory)
+	}
+	return atomicWrite(s.eventPath(id), nil, 0o600)
 }
 
-func (s *Store) restoreCompressedEventsLocked(id string) error {
-	if _, err := os.Stat(s.eventPath(id)); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
+func copyEventDataLimited(destination io.Writer, source io.Reader, total *int64, maximum int64) error {
+	if *total < 0 || *total > maximum {
+		return errEventLogTooLarge
 	}
-	source, err := os.Open(s.eventGzipPath(id))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	remaining := maximum - *total
+	written, err := io.Copy(destination, io.LimitReader(source, remaining+1))
+	*total += written
+	if *total > maximum {
+		return errEventLogTooLarge
 	}
-	if err != nil {
-		return err
-	}
-	reader, err := gzip.NewReader(source)
-	if err != nil {
-		source.Close()
-		return err
-	}
-	data, err := io.ReadAll(reader)
-	reader.Close()
-	source.Close()
-	if err != nil {
-		return err
-	}
-	if err := atomicWrite(s.eventPath(id), data, 0o600); err != nil {
-		return err
-	}
-	return os.Remove(s.eventGzipPath(id))
-}
-
-func (s *Store) openEventReader(id string) (io.Reader, func(), error) {
-	file, err := os.Open(s.eventPath(id))
-	if err == nil {
-		return file, func() { _ = file.Close() }, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, func() {}, err
-	}
-	file, err = os.Open(s.eventGzipPath(id))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, func() {}, os.ErrNotExist
-	}
-	if err != nil {
-		return nil, func() {}, err
-	}
-	reader, err := gzip.NewReader(file)
-	if err != nil {
-		file.Close()
-		return nil, func() {}, fmt.Errorf("open compressed session event log: %w", err)
-	}
-	return reader, func() { _ = reader.Close(); _ = file.Close() }, nil
+	return err
 }

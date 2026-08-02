@@ -64,16 +64,19 @@ func (r Resolver) Resolve(ctx context.Context, source Source) (string, error) {
 	commandContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	command := exec.CommandContext(commandContext, source.Command[0], source.Command[1:]...)
+	configureCredentialCommand(command)
+	command.WaitDelay = time.Second
 	stdout := boundedWriter{limit: stdoutLimit}
 	stderr := boundedWriter{limit: stderrLimit}
 	command.Stdout = &stdout
 	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message != "" {
-			return "", fmt.Errorf("token_command failed: %w: %s", err, message)
-		}
-		return "", fmt.Errorf("token_command failed: %w", err)
+	runErr := command.Run()
+	cleanupCredentialCommand(command)
+	if runErr != nil {
+		return "", fmt.Errorf("token_command failed: %w", runErr)
+	}
+	if stdout.exceeded {
+		return "", fmt.Errorf("token_command output exceeded %d bytes", stdoutLimit)
 	}
 	key := strings.TrimSpace(stdout.String())
 	if key == "" {
@@ -83,8 +86,9 @@ func (r Resolver) Resolve(ctx context.Context, source Source) (string, error) {
 }
 
 type boundedWriter struct {
-	builder strings.Builder
-	limit   int
+	builder  strings.Builder
+	limit    int
+	exceeded bool
 }
 
 func (w *boundedWriter) Write(value []byte) (int, error) {
@@ -93,6 +97,7 @@ func (w *boundedWriter) Write(value []byte) (int, error) {
 	if remaining > 0 {
 		_, _ = w.builder.Write(value[:remaining])
 	}
+	w.exceeded = w.exceeded || remaining < written
 	return written, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/daemon365/supercode/internal/agent"
 	"github.com/daemon365/supercode/internal/attachment"
 	"github.com/daemon365/supercode/internal/prompts"
+	"github.com/daemon365/supercode/internal/provider"
 	"github.com/daemon365/supercode/internal/tool"
 )
 
@@ -133,11 +134,16 @@ func (m model) commandRuntime(invocation slashInvocation) (tea.Model, tea.Cmd) {
 			m.addError(err.Error())
 			break
 		}
-		m.options.Model = modelName
+		m.options.Model = m.runner.Model()
 		m.syncModelLimits()
-		m.session.Model = modelName
-		m.saveSession()
+		m.session.Model = m.options.Model
 		m.addStatus("Model changed to " + modelName + ".")
+		command, err := m.enqueueSessionSave(sessionActionSave, true, "", nil)
+		if err != nil {
+			m.addError("Prepare session save: " + err.Error())
+			break
+		}
+		return m, command
 	case "/permissions":
 		if len(fields) == 1 {
 			m.addStatus("Current approval policy: " + string(m.options.Approval))
@@ -222,8 +228,13 @@ func (m model) commandRuntime(invocation slashInvocation) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.history = compacted
-		m.saveSession()
 		m.addStatus(fmt.Sprintf("Context compacted: %d → %d estimated tokens.", before, agent.EstimateMessagesTokens(compacted)))
+		command, err := m.enqueueSessionSave(sessionActionSave, true, "", nil)
+		if err != nil {
+			m.addError("Prepare compacted session: " + err.Error())
+			break
+		}
+		return m, command
 	case "/review":
 		focus := strings.TrimSpace(strings.TrimPrefix(value, fields[0]))
 		prompt := "Review the current Git changes for correctness, regressions, security issues, and missing tests. Inspect the diff including untracked files, run focused verification when useful, and report findings before any summary."
@@ -236,7 +247,7 @@ func (m model) commandRuntime(invocation slashInvocation) (tea.Model, tea.Cmd) {
 		if len(fields) > 1 && strings.EqualFold(fields[1], "staged") {
 			arguments = `{"staged":true}`
 		}
-		m.executeToolForStatus("git_diff", arguments)
+		return m, m.executeToolForStatus("git_diff", arguments)
 	case "/mention":
 		path := strings.TrimSpace(strings.TrimPrefix(value, fields[0]))
 		if path == "" {
@@ -253,14 +264,13 @@ func (m model) commandRuntime(invocation slashInvocation) (tea.Model, tea.Cmd) {
 			break
 		}
 		encodedPath, _ := json.Marshal(path)
-		result, err := reader.Execute(m.ctx, `{"path":`+string(encodedPath)+`}`)
-		if err != nil {
-			m.addError(err.Error())
-			break
+		arguments := `{"path":` + string(encodedPath) + `}`
+		ctx := m.ctx
+		m.attachmentJobs++
+		return m, func() tea.Msg {
+			result, err := reader.Execute(ctx, arguments)
+			return mentionLoadedMsg{path: path, result: result, err: err}
 		}
-		m.draftContexts = append(m.draftContexts, "File: "+path+"\n```\n"+result.Content+"\n```")
-		m.addStatus("Attached " + path + " to the next message.")
-		m.resize(m.width, m.height)
 	case "/image":
 		path := strings.TrimSpace(strings.TrimPrefix(value, fields[0]))
 		if path == "" {
@@ -268,13 +278,15 @@ func (m model) commandRuntime(invocation slashInvocation) (tea.Model, tea.Cmd) {
 			break
 		}
 		if strings.EqualFold(path, "clipboard") {
-			image, err := attachment.LoadClipboard("high")
-			if err != nil {
-				m.addError(err.Error())
-				break
+			m.attachmentJobs++
+			return m, func() tea.Msg {
+				loaded, err := attachment.LoadClipboard("high")
+				var images []provider.Image
+				if err == nil {
+					images = []provider.Image{loaded}
+				}
+				return imageLoadedMsg{label: "clipboard", images: images, err: err}
 			}
-			m.draftImages = append(m.draftImages, image)
-			m.draftImageLabels = append(m.draftImageLabels, "clipboard")
 		} else {
 			if m.options.Tools == nil {
 				m.addError("Image tools are unavailable.")
@@ -286,16 +298,17 @@ func (m model) commandRuntime(invocation slashInvocation) (tea.Model, tea.Cmd) {
 				break
 			}
 			encoded, _ := json.Marshal(path)
-			result, err := viewer.Execute(m.ctx, `{"path":`+string(encoded)+`}`)
-			if err != nil {
-				m.addError(err.Error())
-				break
+			arguments := `{"path":` + string(encoded) + `}`
+			ctx := m.ctx
+			m.attachmentJobs++
+			return m, func() tea.Msg {
+				result, err := viewer.Execute(ctx, arguments)
+				if err == nil && result.IsError {
+					err = fmt.Errorf("%s", result.Content)
+				}
+				return imageLoadedMsg{label: path, images: result.Images, err: err}
 			}
-			m.draftImages = append(m.draftImages, result.Images...)
-			m.draftImageLabels = append(m.draftImageLabels, path)
 		}
-		m.addStatus("Attached image to the next message.")
-		m.resize(m.width, m.height)
 	case "/detach":
 		if len(fields) == 1 || strings.EqualFold(fields[1], "all") {
 			m.draftImages, m.draftImageLabels, m.draftContexts, m.draftPastes = nil, nil, nil, nil
@@ -330,7 +343,7 @@ func (m model) commandWorkflow(invocation slashInvocation) (tea.Model, tea.Cmd) 
 	fields := invocation.Fields
 	switch invocation.Name {
 	case "/ps":
-		m.executeToolForStatus("list_processes", `{}`)
+		return m, m.executeToolForStatus("list_processes", `{}`)
 	case "/stop":
 		if len(fields) != 2 {
 			m.addError("Usage: /stop <session-id|all>")
@@ -345,7 +358,7 @@ func (m model) commandWorkflow(invocation slashInvocation) (tea.Model, tea.Cmd) 
 			}
 			arguments = fmt.Sprintf(`{"session_id":%d}`, id)
 		}
-		m.executeToolForStatus("stop_process", arguments)
+		return m, m.executeToolForStatus("stop_process", arguments)
 	case "/plan":
 		if len(fields) > 1 {
 			switch strings.ToLower(fields[1]) {
@@ -373,8 +386,13 @@ func (m model) commandWorkflow(invocation slashInvocation) (tea.Model, tea.Cmd) 
 			m.showPlan = true
 			m.addStatus("Collaboration mode: " + map[bool]string{true: "Plan", false: "Default"}[m.planMode] + ".")
 		}
-		m.saveSession()
 		m.resize(m.width, m.height)
+		command, err := m.enqueueSessionSave(sessionActionSave, true, "", nil)
+		if err != nil {
+			m.addError("Prepare session save: " + err.Error())
+			break
+		}
+		return m, command
 	case "/mode":
 		if len(fields) == 1 {
 			m.addStatus("Collaboration mode: " + string(m.collaborationMode) + ". Available modes: default, plan, execute, pair.")
@@ -390,9 +408,14 @@ func (m model) commandWorkflow(invocation slashInvocation) (tea.Model, tea.Cmd) 
 		if mode == prompts.ModePlan {
 			m.showPlan = true
 		}
-		m.saveSession()
 		m.resize(m.width, m.height)
 		m.addStatus("Collaboration mode: " + string(mode) + ".")
+		command, err := m.enqueueSessionSave(sessionActionSave, true, "", nil)
+		if err != nil {
+			m.addError("Prepare session save: " + err.Error())
+			break
+		}
+		return m, command
 	case "/goal":
 		if m.taskState == nil {
 			m.addStatus("No goal exists.")
@@ -414,12 +437,14 @@ func (m model) commandWorkflow(invocation slashInvocation) (tea.Model, tea.Cmd) 
 		if len(fields) > 1 && strings.EqualFold(fields[1], "reload") {
 			if m.skills == nil {
 				m.addError("Skill catalog is unavailable.")
-			} else if err := m.skills.Reload(); err != nil {
-				m.addError(err.Error())
-			} else {
-				m.addStatus(fmt.Sprintf("Reloaded %d skill(s).", m.skills.Len()))
+				break
 			}
-			break
+			catalog := m.skills
+			m.runtimeJobs++
+			return m, func() tea.Msg {
+				err := catalog.Reload()
+				return skillReloadedMsg{count: catalog.Len(), err: err}
+			}
 		}
 		m.openSkillPicker()
 	}

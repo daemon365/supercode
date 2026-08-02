@@ -132,8 +132,15 @@ func runMCPCommand(ctx context.Context, configPath, workspace string, configurat
 			return err
 		}
 		defer manager.Close()
-		_, err = fmt.Fprintf(output, "Connected %d server(s); discovered %d tool/resource/prompt entries.\n", len(configurations), len(manager.Tools()))
-		return err
+		if _, err = fmt.Fprintf(output, "Connected %d of %d server(s); discovered %d tool/resource/prompt entries.\n", len(manager.Names()), len(configurations), len(manager.Tools())); err != nil {
+			return err
+		}
+		for _, failure := range manager.Failures() {
+			if _, err = fmt.Fprintln(output, "Failed:", failure); err != nil {
+				return err
+			}
+		}
+		return errors.Join(manager.Failures()...)
 	default:
 		return fmt.Errorf("unknown MCP action %q", options.mcpAction)
 	}

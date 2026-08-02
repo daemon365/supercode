@@ -2,7 +2,7 @@
 
 [English](README.md) · [简体中文](README_CN.md)
 
-SuperCode is a local-first terminal coding agent inspired by Claude Code and OpenCode. It has a provider-neutral agent loop backed by the official OpenAI Go SDK and the OpenAI-compatible Chat Completions protocol, so custom endpoints such as DeepSeek can use streaming text and tool calls without coupling the rest of the application to one SDK.
+SuperCode is a local-first terminal coding agent inspired by Claude Code and OpenCode. Its provider-neutral agent loop supports OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and OpenRouter through their official Go SDKs, including streaming text and tool calls across multiple configured endpoints.
 
 The current v1 includes workspace-scoped coding tools, atomic multi-file edits, persistent PTY processes, multimodal image inspection, approved web access, recursive sub-agent collaboration, structured plans and goals, active-turn message steering, crash-recoverable sessions, MCP servers, lifecycle hooks, local plugins, `SKILL.md` activation, bounded long-term memory, slash commands, and an isolated full-screen terminal UI with live Markdown responses.
 
@@ -53,9 +53,10 @@ Then start the full-screen terminal chat:
 go run . chat
 ```
 
-The interface is built with Bubble Tea, Bubbles, Lip Gloss, and Glamour. It enters an alternate-screen page by default and restores the previous shell page on exit. Mouse reporting stays disabled so text can be selected and copied normally. Standard terminal alternate-scroll mode maps the mouse wheel to transcript scrolling while the composer is empty; `PgUp`/`PgDn` always scroll the SuperCode conversation deterministically. Use `--no-alt-screen` or `alternate_screen: false` for terminal-native persistent scrollback instead. User messages appear as gray `> message` blocks; assistant responses are rendered as GFM-compatible terminal Markdown during streaming without role labels. Tool activity uses dedicated tool views: commands render as `Running`, `Ran`, or a live process session; searches include the query and searched path/glob; edits render complete, untruncated line-level `Added`/`Edited`/`Deleted`/`Moved` diffs; and Plan, Web, Goal, image, session, and sub-agent tools show useful fields instead of raw JSON.
+The interface is built with Bubble Tea, Bubbles, Lip Gloss, and Glamour. It enters an alternate-screen page by default and restores the previous shell page on exit. Mouse reporting stays disabled so text can be selected and copied normally. Standard terminal alternate-scroll mode maps the mouse wheel to transcript scrolling while the composer is empty; `PgUp`/`PgDn` always scroll the SuperCode conversation deterministically. Use `--no-alt-screen` or `alternate_screen: false` for terminal-native persistent scrollback instead. User messages appear as gray `> message` blocks; assistant responses are rendered as GFM-compatible terminal Markdown during streaming and remain rendered after completion, without role labels. Streaming deltas are coalesced into short display frames so long Markdown and code responses do not re-render once per token. Tool activity uses dedicated tool views: commands render as `Running`, `Ran`, or a live process session; searches include the query and searched path/glob; edits render complete, untruncated line-level `Added`/`Edited`/`Deleted`/`Moved` diffs; and Plan, Web, Goal, image, session, and sub-agent tools show useful fields instead of raw JSON.
 
 - `Enter`: send a message; `Shift+Enter`, `Alt+Enter`, or `Ctrl+J` inserts a newline
+- `↑` / `↓`: move within a multiline draft first, then recall up to 100 submitted inputs (including a loaded session's prompts) and restore the current draft when returning to the newest entry
 - `Esc`: stop the active model/tool stream, keep partial output, and return focus to the composer
 - `Ctrl+G` or `/editor`: edit the current draft in `$VISUAL` or `$EDITOR`
 - Type `/` to open the searchable command menu; use `↑`/`↓`, `Tab`, and `Enter`
@@ -88,7 +89,7 @@ The interface is built with Bubble Tea, Bubbles, Lip Gloss, and Glamour. It ente
 - `/forget [text]`: queue a memory deletion or correction for consolidation
 - `/queue`: inspect guidance queued during the active turn
 - `/help`: show grouped, Markdown-rendered command help
-- `/exit`, `/quit`, or `Ctrl+C`: quit
+- `/exit`, `/quit`, or `Ctrl+C`: begin a graceful shutdown that stops the active turn, saves the session, and (when `memory_generate: true`) processes the current session into long-term memory. Progress remains visible; press `Ctrl+C` again to force quit.
 
 Mouse reporting is disabled in both full-screen and inline modes, so ordinary drag-to-select remains available. `/copy` and `/raw` provide reliable alternatives when a terminal has unusual clipboard behavior.
 
@@ -98,7 +99,7 @@ When an operation needs approval, SuperCode opens a separate selection card. Use
 
 While an agent turn is running, the input remains active. Pressing `Enter` queues the message under **Messages to be submitted after next tool call**. The message is inserted after the current tool-call batch, or as a follow-up when the model finishes without calling a tool. Type `/queue` during a turn to inspect queued messages.
 
-Completed turns are saved under `~/.supercode/sessions/`. `index.json` provides searchable metadata and full-text routing without SQLite; snapshots remain authoritative JSON files. Append-only JSONL events provide crash recovery, archived logs are compressed as `.jsonl.gz`, and image inputs are content-addressed under `assets/<session-id>/` so multimodal sessions resume without losing images. The store detects legacy or out-of-band snapshots and can rebuild its index without deleting invalid files. Cross-session memory lives under `~/.supercode/memories/`; a historical `~/.supercode/memory.md` is migrated once into an explicit note. Files use local mode `0600`; containing directories use mode `0700`.
+Completed turns are saved under `~/.supercode/sessions/`. `index.json` provides incrementally updated searchable metadata and full-text routing without SQLite. New messages append to a sequenced JSONL write-ahead log, while authoritative JSON snapshots are refreshed adaptively after enough deltas or WAL growth. Resume replays only records newer than the snapshot, repairs an incomplete final record, and reports corruption in the middle instead of silently discarding it. WAL segments covered by a snapshot are compressed as `.jsonl.gz`. This bounds snapshot write amplification while retaining crash recovery and compatibility with legacy full `checkpoint` events. Image inputs are content-addressed under `assets/<session-id>/` so multimodal sessions resume without losing images. Cross-process locks prevent concurrent writers from losing revisions, and the store can rebuild its index from snapshots plus WAL without deleting invalid files. Cross-session memory lives under `~/.supercode/memories/`; a historical `~/.supercode/memory.md` is migrated once into an explicit note. Files use local mode `0600`; containing directories use mode `0700`.
 
 ## Coding tools and approvals
 
@@ -122,17 +123,17 @@ The model can call these provider-neutral tools:
 | `memories_search` / `memories_read` / `memories_list` | Search, read, or list public long-term Markdown memory | Automatic read-only |
 | `memories_add_ad_hoc_note` | Queue an explicitly requested remember/forget/update note | Ask as a write |
 | `tool_search` | Search and lazily enable MCP tools | Automatic |
-| `mcp__<server>__<tool>` | Invoke a dynamically discovered MCP tool | Read-only annotations automatic; others ask |
+| `mcp__<server>__<tool>` | Invoke a dynamically discovered MCP tool | Always asks by default; remote annotations are not trusted as an approval boundary |
 | `update_plan` | Update the structured task plan | Automatic |
 | `create_goal` / `get_goal` / `update_goal` | Manage an explicitly requested long-term goal | Automatic |
 | `spawn_agent` / `send_message` / `followup_task` | Start or steer bounded sub-agents | Automatic orchestration |
 | `interrupt_agent` / `list_agents` / `wait_agent` | Control and observe sub-agents | Automatic orchestration |
 
-File tools reject paths and symbolic links that escape the configured roots. Tool output is bounded, commands have a timeout, and agent runs can use a configurable model-turn limit (`0` means unlimited). `exec_command`, `write_stdin`, and `wait` stream process deltas into the active tool card before completion while retaining the final bounded observation for the model. `exec_command` keeps long-running processes in a session so later calls can continue them. `view_image` returns image input through the provider-neutral message model. `web__run` blocks private, loopback, link-local, and non-HTTP targets by default.
+File tools reject paths and symbolic links that escape the configured roots. Tool output is bounded, commands have a timeout, and agent runs can use a configurable model-turn limit (`0` means unlimited). Independent tools that explicitly opt into parallel safety—such as workspace reads and typed MCP resource/prompt reads—run concurrently with a process-wide eight-call bound while results remain in model-call order; stateful reads and all write/execute operations stay ordered. Dynamic remote MCP tool calls are ordered and approval-gated regardless of server annotations. `exec_command`, `write_stdin`, and `wait` stream process deltas into the active tool card before completion while retaining a rolling 1 MiB tail as the final bounded observation for the model. Live streaming continues after that retention window fills. `exec_command` keeps long-running processes in a session so later calls can continue them, and cancellation or shutdown terminates its process tree. `view_image` returns image input through the provider-neutral message model. `web__run` blocks private, loopback, link-local, multicast, non-global-unicast, and non-HTTP targets; approval is checked again for the actual endpoint and every redirect, and its page cache is byte-bounded.
 
 On Linux, SuperCode probes Bubblewrap at startup. When available, shell commands see the host filesystem as read-only, configured write roots are reopened for writes, deny roots plus `.git` and `.supercode` remain protected, `/tmp` is ephemeral, and the process runs in separate user and PID namespaces. Additional `read_roots`, `write_roots`, and `deny_roots` can be configured in YAML. Network namespaces are enabled when the host permits them. If the host cannot isolate networking, only a conservative set of non-networking read commands can skip approval; all other commands require approval. `sandbox_permissions: require-escalated` runs outside this boundary only after approval and requires a justification. macOS and Windows explicitly report an approval-only fallback in `/status`; they are never mislabeled as equivalent native sandboxes.
 
-The default `on-request` policy treats validated workspace file edits as workspace-write operations: they do not need a second confirmation. Non-read shell commands, network requests, unannotated MCP calls, and process termination use the approval card. `request_permissions` can add canonical file-system roots and URL-aware network grants for one turn or the session. A domain grant does not disable shell network isolation; only an explicit `*` protocol plus `*` domain grant can do that. `granular` follows `approval_categories` and fails closed for categories configured as `false`; `always` allows requests and `never` denies them. In non-interactive mode, an unresolved approval is denied; use `--approval always` only in a workspace and with a model endpoint you trust.
+The default `on-request` policy treats validated workspace file edits as workspace-write operations: they do not need a second confirmation. Non-read shell commands, network requests, dynamic remote MCP tool calls, and process termination use the approval card. `request_permissions` can add canonical file-system roots and URL-aware network grants for one turn or the session. A domain grant does not disable shell network isolation; only an explicit `*` protocol plus `*` domain grant can do that. `granular` follows `approval_categories` and fails closed for categories configured as `false`; `always` allows requests and `never` denies them. In non-interactive mode, an unresolved approval is denied; use `--approval always` only in a workspace and with a model endpoint you trust.
 
 PDF page screenshots use the `pdftoppm` executable from Poppler when available; other `web__run` operations do not require it.
 
@@ -182,7 +183,7 @@ Long-term memory is file-backed; it does not use SQLite, embeddings, or a vector
   extensions/ad_hoc/notes/*.md       explicit remember/forget/update notes
 ```
 
-When `memory_generate: true`, startup launches a bounded background pipeline. Phase 1 considers only non-current, non-archived root sessions from the last 10 days that have been idle for at least six hours, processing at most two per run. It asks the configured extraction model at low reasoning for strict JSON containing detailed memory and a routing summary. Phase 2 ranks up to 256 successful extracts by use count and recency, includes explicit notes, and asks the consolidation model at medium reasoning for `MEMORY.md`, `memory_summary.md`, and optional Skills. Empty model names use the active chat model. Inputs and outputs are secret-redacted, and the private memory directory maintains its own Git baseline for consolidation diffs.
+When `memory_generate: true`, startup launches a bounded background pipeline. Phase 1 considers only non-current, non-archived root sessions from the last 10 days that have been idle for at least six hours, processing at most two per run. A graceful TUI exit first commits the current root session, then processes it immediately without the startup idle cutoff; a redacted content hash skips duplicate work when only session metadata changed. It asks the configured extraction model at low reasoning for strict JSON containing detailed memory and a routing summary. Phase 2 ranks up to 256 successful extracts by use count and recency, includes explicit notes, and asks the consolidation model at medium reasoning for `MEMORY.md`, `memory_summary.md`, and optional Skills. Empty model names use the active chat model. Inputs and outputs are secret-redacted, and the private memory directory maintains its own Git baseline for consolidation diffs.
 
 Only `memory_summary.md`, truncated to `memory_max_tokens` (2,500 by default), is injected into a normal turn. The model searches detailed memory on demand with the dedicated read-only tools. Hidden memory citations are removed from visible streamed output and update `usage_count` and `last_usage` in `state.json`, which influences future consolidation priority. `/remember` and `/forget` create append-only notes; they do not directly rewrite generated memory. Automatic model generation is disabled by default to avoid unexpected API cost, while use of already generated memory is enabled by default.
 
@@ -190,9 +191,9 @@ Project instructions are discovered from the Git/project root to the working dir
 
 ## Prompt architecture
 
-SuperCode uses an embedded, provider-neutral prompt package. The wording is adapted to SuperCode's Chat Completions client and tool contracts.
+SuperCode uses an embedded, provider-neutral prompt package. The wording is adapted to SuperCode's provider-neutral model boundary and tool contracts.
 
-Stable session instructions contain the coding-agent behavior, communication rules, tool discipline, project instructions, `apply_patch` contract, and multi-agent orchestration policy. Per-turn instructions add the active collaboration mode, approval and sandbox status, model, date, workspace, context budget, selected Skills, Memory, plugins, hooks, MCP servers, and active Goal. The two layers are combined into the portable `Instructions` field and sent as one system message because that is supported consistently by OpenAI-compatible Chat Completions endpoints.
+Stable session instructions contain the coding-agent behavior, communication rules, tool discipline, project instructions, `apply_patch` contract, and multi-agent orchestration policy. Per-turn instructions add the active collaboration mode, approval and sandbox status, model, date, workspace, context budget, selected Skills, Memory, plugins, hooks, MCP servers, and active Goal. The two layers are combined into the portable `Instructions` field; each provider adapter maps it to that API's native instruction or system-message representation.
 
 The `default`, `plan`, `execute`, and `pair` modes are persisted with the session and can be changed with `/mode`. `/plan` remains a shortcut for entering or leaving Plan mode and for showing or hiding the structured plan panel. Review, goal continuation, Apply Patch, multi-agent orchestration, awaiter, Memory extraction, and Memory consolidation prompts are connected to their matching client workflows. Compact remains deterministic and local; Guardian and Realtime templates remain explicit integration points without model-backed runtimes.
 
@@ -200,6 +201,8 @@ The `default`, `plan`, `execute`, and `pair` modes are persisted with the sessio
 ## MCP, hooks, and plugins
 
 Trusted configuration can add MCP servers over stdio or Streamable HTTP. Protocol negotiation, transport framing, pagination, and typed content are handled by the official MCP Go SDK. Tools are discovered during startup and named `mcp__<server>__<tool>`. MCP tools stay out of the model request until `tool_search` selects them, reducing context use. Resource and Prompt capabilities are exposed as server-specific tools. HTTP credentials can use environment-expanded headers or an `oauth_token_command` whose stdout supplies a bearer token without storing it in YAML. `supercode mcp status [name]` connects to a server and reports availability; `supercode mcp reload` validates all enabled servers; `supercode mcp login|logout <name> [...]` configures or removes an OAuth token command.
+
+Configured MCP servers connect and discover tools concurrently with an independent startup timeout. A failed server emits a warning while healthy servers remain available; `mcp status` and `mcp reload` report every failure and return an error when validation is incomplete.
 
 ```yaml
 mcp_servers:
@@ -235,7 +238,7 @@ command-line flags > environment variables > trusted project config > user confi
 
 The user configuration directory uses mode `0700`, and the file uses mode `0600`. Existing configuration content is never overwritten during normal startup. A project file at `.supercode/config.yaml` is ignored until the workspace is explicitly enabled with `--trust-project`; `/config` or `--config-diagnostics` shows the active sources. Trust is stored by canonical workspace path so a symlink cannot inherit another project's decision.
 
-API-key precedence is `OPENAI_API_KEY`, then `token_command`, then YAML `token`. `token_command` executes an argument vector directly, has a five-second timeout, and reads a bounded token from stdout. It can bridge Secret Service, macOS Keychain, a password manager, or another system credential helper. A YAML token remains local plaintext; leaving it blank is safer:
+For the legacy single endpoint, API-key precedence is `OPENAI_API_KEY`, then `token_command`, then YAML `token`. `token_command` executes an argument vector directly, has a five-second timeout, and reads a bounded token from stdout. It can bridge Secret Service, macOS Keychain, a password manager, or another system credential helper. A YAML token remains local plaintext; leaving it blank is safer:
 
 ```bash
 export OPENAI_API_KEY="your_api_key"
@@ -248,6 +251,8 @@ Supported environment variables:
 | `OPENAI_API_KEY` | API token; overrides YAML `token` |
 | `OPENAI_BASE_URL` | API base URL |
 | `OPENAI_MODEL` | Model ID |
+| `ANTHROPIC_API_KEY` | Default key for an `anthropic` provider |
+| `OPENROUTER_API_KEY` | Default key for an `openrouter` provider |
 | `SUPERCODE_STREAM` | Enables or disables streaming |
 | `SUPERCODE_TIMEOUT` | Request timeout, such as `30s` or `2m` |
 | `SUPERCODE_INSTRUCTIONS` | Developer instructions |
@@ -332,6 +337,43 @@ go run . \
 
 The configured token is sent to this URL, so only connect to services you trust. A compatible service must implement the OpenAI Chat Completions API and its data-only SSE format when streaming is enabled.
 
+### Multiple providers
+
+Use `providers` to select models across multiple URLs and protocols:
+
+```yaml
+model: openai/gpt-4o
+providers:
+  - name: openai
+    provider: openai
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    models: [gpt-4o, gpt-4o-mini]
+  - name: responses
+    provider: openai_responses
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    models: [gpt-5-codex]
+  - name: anthropic
+    provider: anthropic
+    url: https://api.anthropic.com
+    token: ${ANTHROPIC_API_KEY}
+    maxTokens: 8192
+    models: [claude-sonnet-4-6, claude-opus-4-6]
+  - name: openrouter
+    provider: openrouter
+    url: https://openrouter.ai/api/v1
+    token: ${OPENROUTER_API_KEY}
+    models: [openai/gpt-4o, anthropic/claude-sonnet-4]
+    headers:
+      HTTP-Referer: https://example.com
+      X-OpenRouter-Title: SuperCode
+```
+
+Every provider has its own `url`, `token`, and optional `token_command`; top-level endpoint credentials are not inherited by provider entries. `openai` uses `/chat/completions`, `openai_responses` uses `/responses`, `anthropic` uses `/v1/messages`, and `openrouter` uses `/chat/completions`. An Anthropic `url` may include or omit a trailing `/v1`. `token: ${NAME}` resolves that exact environment variable; when `token` is omitted, the provider defaults to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENROUTER_API_KEY`.
+
+The stable selector is `provider-name/model-id`, such as `responses/gpt-5-codex`. An unqualified model ID is accepted when it is unique; duplicate model IDs require the qualified selector. The model picker renders the identity as `gpt-5-codex [in responses]`, with the provider suffix dimmed. Legacy `url`, `token`, and `models` configuration remains supported as one OpenAI-compatible Chat Completions endpoint.
+
 ## Non-interactive usage
 
 Arguments produce a one-shot request:
@@ -398,6 +440,9 @@ internal/collaboration/        Recursive, persisted sub-agent lifecycle
 internal/taskstate/            Structured plan and explicit goal state
 internal/provider/             Provider-neutral request, response, and stream types
 internal/provider/openai/      OpenAI-compatible Chat Completions adapter
+internal/provider/openairesponses/ OpenAI Responses adapter
+internal/provider/anthropic/   Anthropic Messages adapter
+internal/provider/openrouter/  OpenRouter adapter
 internal/session/              Indexed JSON snapshots, assets, and compressed event logs
 internal/skill/                SKILL.md discovery and exact local-path injection
 internal/memory/               File-backed extraction, consolidation, retrieval, and usage feedback

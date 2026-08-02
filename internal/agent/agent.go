@@ -3,11 +3,13 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daemon365/supercode/internal/modelcatalog"
@@ -15,6 +17,11 @@ import (
 	"github.com/daemon365/supercode/internal/policy"
 	"github.com/daemon365/supercode/internal/provider"
 	"github.com/daemon365/supercode/internal/tool"
+)
+
+const (
+	maxReturnedToolImages     = 8
+	maxReturnedToolImageBytes = int64(64 * 1024 * 1024)
 )
 
 type ApprovalMode string
@@ -183,12 +190,22 @@ func (r *ApprovalRequest) DecideWithScope(decision ApprovalDecision) {
 }
 
 type Runner struct {
-	provider provider.Provider
-	tools    *tool.Registry
-	options  Options
-	rulesMu  sync.RWMutex
-	rules    map[string]struct{}
+	provider               provider.Provider
+	tools                  *tool.Registry
+	options                Options
+	eventsMu               sync.Mutex
+	rulesMu                sync.RWMutex
+	rules                  map[string]struct{}
+	toolSlots              chan struct{}
+	managesPermissionTurns bool
+	callIDPrefix           string
+	callIDSequence         atomic.Uint64
 }
+
+var (
+	runnerIDSequence    atomic.Uint64
+	globalParallelSlots = make(chan struct{}, parallelToolLimit)
+)
 
 // RunHandle permits user messages to steer an active turn at the next tool
 // boundary while events continue streaming independently.
@@ -258,7 +275,12 @@ func New(modelProvider provider.Provider, registry *tool.Registry, options Optio
 	if _, err := ParseApprovalMode(string(options.Approval)); err != nil {
 		return nil, err
 	}
-	return &Runner{provider: modelProvider, tools: registry, options: options, rules: make(map[string]struct{})}, nil
+	runnerID := runnerIDSequence.Add(1)
+	return &Runner{
+		provider: modelProvider, tools: registry, options: options, rules: make(map[string]struct{}),
+		toolSlots: globalParallelSlots, managesPermissionTurns: true,
+		callIDPrefix: fmt.Sprintf("%x_%x", time.Now().UnixNano(), runnerID),
+	}, nil
 }
 
 func (r *Runner) ToolNames() []string { return r.tools.Names() }
@@ -270,6 +292,13 @@ func (r *Runner) SetModel(model string) error {
 	if model == "" {
 		return provider.ErrEmptyModel
 	}
+	if resolver, ok := r.provider.(provider.ModelResolver); ok {
+		resolved, err := resolver.ResolveModel(model)
+		if err != nil {
+			return err
+		}
+		model = resolved.Selector
+	}
 	if r.options.ModelCatalog != nil {
 		if err := r.options.ModelCatalog.Validate(model, r.options.ReasoningEffort, r.options.ServiceTier); err != nil {
 			return err
@@ -279,6 +308,8 @@ func (r *Runner) SetModel(model string) error {
 	r.options.Model = model
 	return nil
 }
+
+func (r *Runner) Model() string { return r.options.Model }
 
 func (r *Runner) ContextLimits() (int, int, int) {
 	return r.options.ContextWindowTokens, r.options.AutoCompactTokens, r.options.UsableContextTokens
@@ -311,13 +342,29 @@ func (r *Runner) SetServiceTier(value string) {
 // limits, and hooks. It lets sub-agents select another compatible model without
 // mutating the parent runner.
 func (r *Runner) Fork(model string, approval ApprovalMode) (*Runner, error) {
+	return r.ForkConfigured(model, approval, "")
+}
+
+// ForkConfigured creates a child runner while applying model-specific
+// reasoning configuration. Child runs share the parent's global read-tool
+// budget, but do not expire grants owned by the parent user turn.
+func (r *Runner) ForkConfigured(model string, approval ApprovalMode, reasoningEffort string) (*Runner, error) {
 	options := r.options
 	if strings.TrimSpace(model) != "" {
 		options.Model = strings.TrimSpace(model)
 	}
+	if strings.TrimSpace(reasoningEffort) != "" {
+		options.ReasoningEffort = strings.TrimSpace(reasoningEffort)
+	}
 	options.Approval = approval
 	options.OnUsage = nil
-	return New(r.provider, r.tools, options)
+	child, err := New(r.provider, r.tools, options)
+	if err != nil {
+		return nil, err
+	}
+	child.toolSlots = r.toolSlots
+	child.managesPermissionTurns = false
+	return child, nil
 }
 
 func (r *Runner) NotifyHook(ctx context.Context, event HookEvent, input HookInput) error {
@@ -343,7 +390,7 @@ func (r *Runner) Start(ctx context.Context, input Input) *RunHandle {
 }
 
 func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, steer <-chan string) error {
-	if r.options.Permissions != nil && r.options.Approval != ApprovalNever {
+	if r.options.Permissions != nil && r.managesPermissionTurns {
 		r.options.Permissions.BeginTurn()
 	}
 	prompt := strings.TrimSpace(input.Prompt)
@@ -372,12 +419,6 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 	if r.options.ModelCatalog != nil {
 		capabilities, hasCapabilities = r.options.ModelCatalog.Resolve(r.options.Model)
 	}
-	if hasCapabilities && capabilities.ToolCalling != nil && !*capabilities.ToolCalling {
-		allDefinitions = nil
-	}
-	if hasCapabilities && len(input.Images) > 0 && len(capabilities.InputModalities) > 0 && !capabilities.Supports("image") {
-		return fmt.Errorf("model %s does not advertise image input support", r.options.Model)
-	}
 	definitions := make([]provider.ToolDefinition, 0, len(allDefinitions))
 	definitionByName := make(map[string]provider.ToolDefinition, len(allDefinitions))
 	enabledDefinitions := make(map[string]bool, len(allDefinitions))
@@ -396,9 +437,15 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 		enabledDefinitions[definition.Name] = true
 	}
 	definitionTokens := estimateDefinitionTokens(definitions)
+	modelDefinitionTokens := func() int {
+		if hasCapabilities && capabilities.ToolCalling != nil && !*capabilities.ToolCalling {
+			return 0
+		}
+		return definitionTokens
+	}
 
 	for turn := 0; r.options.MaxTurns == 0 || turn < r.options.MaxTurns; turn++ {
-		beforeTokens := EstimateMessagesTokens(conversation) + EstimateTextTokens(prompt) + EstimateTextTokens(instructions) + definitionTokens
+		beforeTokens := EstimateMessagesTokens(conversation) + EstimateTextTokens(prompt) + EstimateTextTokens(instructions) + modelDefinitionTokens()
 		if beforeTokens >= r.options.AutoCompactTokens {
 			if err := r.runInformationalHook(ctx, HookPreCompact, HookInput{BeforeTokens: beforeTokens}); err != nil {
 				return err
@@ -413,7 +460,7 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 				}
 			}
 		}
-		requestTokens := EstimateMessagesTokens(conversation) + EstimateTextTokens(prompt) + EstimateTextTokens(instructions) + definitionTokens
+		requestTokens := EstimateMessagesTokens(conversation) + EstimateTextTokens(prompt) + EstimateTextTokens(instructions) + modelDefinitionTokens()
 		if requestTokens >= r.options.UsableContextTokens {
 			return fmt.Errorf("estimated request context is %d tokens, exceeding the configured %d-token usable limit within the nominal %d-token window; use /compact or raise usable_context_tokens", requestTokens, r.options.UsableContextTokens, r.options.ContextWindowTokens)
 		}
@@ -434,6 +481,11 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 			conversation = append(conversation, provider.Message{Role: provider.MessageRoleUser, Content: prompt, Images: append([]provider.Image(nil), input.Images...)})
 			prompt = ""
 			input.Images = nil
+		}
+		for index := range response.ToolCalls {
+			if response.ToolCalls[index].ID == "" {
+				response.ToolCalls[index].ID = fmt.Sprintf("call_%s_%d", r.callIDPrefix, r.callIDSequence.Add(1))
+			}
 		}
 		conversation = append(conversation, provider.Message{
 			Role: provider.MessageRoleAssistant, Content: response.Text,
@@ -457,30 +509,90 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 			return nil
 		}
 
-		var returnedImages []provider.Image
-		for index, call := range response.ToolCalls {
-			if call.ID == "" {
-				call.ID = fmt.Sprintf("call_%d_%d", turn+1, index+1)
+		parallelBatch := len(response.ToolCalls) > 1
+		for _, call := range response.ToolCalls {
+			item, exists := r.tools.Lookup(call.Name)
+			if !exists || !tool.CanRunInParallel(item, call.Arguments) {
+				parallelBatch = false
+				break
 			}
+		}
+		var returnedImages []provider.Image
+		var returnedImageBytes int64
+		commitPrepared := func(current *preparedToolCall) error {
+			if current.item != nil && !current.finished {
+				return errors.New("tool call execution did not produce a result")
+			}
+			if current.item != nil && current.executed && r.options.Hook != nil {
+				if _, hookErr := r.options.Hook(ctx, HookPostToolUse, HookInput{Call: &current.call, Risk: current.risk, Category: current.category, Result: &current.result}); hookErr != nil {
+					return hookErr
+				}
+			}
+			if current.call.Name == "tool_search" {
+				if added := activateSearchedDefinitions(current.result.Content, definitionByName, enabledDefinitions, &definitions); added {
+					definitionTokens = estimateDefinitionTokens(definitions)
+				}
+			}
+			if len(current.result.Images) > 0 {
+				imageBytes, imageErr := validateReturnedToolImages(current.result.Images, len(returnedImages), returnedImageBytes, maxReturnedToolImages, maxReturnedToolImageBytes)
+				if imageErr != nil {
+					current.result.Images = nil
+					current.result.IsError = true
+					current.result.Content = boundToolContent(strings.TrimSpace(current.result.Content+"\nError: "+imageErr.Error()), r.options.ToolOutputTokens)
+				} else {
+					returnedImageBytes += imageBytes
+				}
+			}
+			conversation = append(conversation, toolMessage(current.call.ID, current.result))
+			returnedImages = append(returnedImages, current.result.Images...)
+			if !r.emit(ctx, events, Event{Type: EventToolFinished, Call: &current.call, Risk: current.risk, Category: current.category, Result: &current.result}) {
+				return ctx.Err()
+			}
+			return nil
+		}
+		executeAndCommit := func(current *preparedToolCall) error {
+			if !current.finished {
+				single := []preparedToolCall{*current}
+				r.executePreparedCalls(ctx, events, single)
+				*current = single[0]
+			}
+			return commitPrepared(current)
+		}
+
+		prepared := make([]preparedToolCall, 0, len(response.ToolCalls))
+		for _, call := range response.ToolCalls {
+			current := preparedToolCall{call: call}
 			item, exists := r.tools.Lookup(call.Name)
 			if !exists {
-				result := tool.Result{Content: fmt.Sprintf("Unknown tool %q.", call.Name), IsError: true}
-				conversation = append(conversation, toolMessage(call.ID, result))
-				r.emit(ctx, events, Event{Type: EventToolFinished, Call: &call, Result: &result})
+				current.result = tool.Result{Content: fmt.Sprintf("Unknown tool %q.", call.Name), IsError: true}
+				current.finished = true
+				if !parallelBatch {
+					if err := executeAndCommit(&current); err != nil {
+						return err
+					}
+				}
+				prepared = append(prepared, current)
 				continue
 			}
 
 			risk, summary := item.Risk(call.Arguments), item.Summary(call.Arguments)
 			category := tool.CategoryOf(item)
+			current.item, current.risk, current.category = item, risk, category
 			if r.options.Hook != nil {
 				output, hookErr := r.options.Hook(ctx, HookPreToolUse, HookInput{Call: &call, Risk: risk, Category: category})
 				if hookErr != nil {
 					return hookErr
 				}
 				if output.Allow != nil && !*output.Allow {
-					result := tool.Result{Content: "Tool call blocked by pre_tool_use hook: " + strings.TrimSpace(output.Message), IsError: true}
-					conversation = append(conversation, toolMessage(call.ID, result))
-					r.emit(ctx, events, Event{Type: EventToolFinished, Call: &call, Risk: risk, Result: &result})
+					current.risk, current.category = risk, category
+					current.result = tool.Result{Content: "Tool call blocked by pre_tool_use hook: " + strings.TrimSpace(output.Message), IsError: true}
+					current.finished = true
+					if !parallelBatch {
+						if err := executeAndCommit(&current); err != nil {
+							return err
+						}
+					}
+					prepared = append(prepared, current)
 					continue
 				}
 				if strings.TrimSpace(output.Arguments) != "" {
@@ -491,6 +603,7 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 					risk, summary = item.Risk(call.Arguments), item.Summary(call.Arguments)
 				}
 			}
+			current.call, current.risk, current.category = call, risk, category
 			if !r.emit(ctx, events, Event{Type: EventToolStarted, Call: &call, Risk: risk, Category: category, Summary: summary}) {
 				return ctx.Err()
 			}
@@ -499,9 +612,14 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 				return err
 			}
 			if decision == ApprovalDeny {
-				result := tool.Result{Content: "Tool call denied by the user or approval policy.", IsError: true}
-				conversation = append(conversation, toolMessage(call.ID, result))
-				r.emit(ctx, events, Event{Type: EventToolFinished, Call: &call, Risk: risk, Result: &result})
+				current.result = tool.Result{Content: "Tool call denied by the user or approval policy.", IsError: true}
+				current.finished = true
+				if !parallelBatch {
+					if err := executeAndCommit(&current); err != nil {
+						return err
+					}
+				}
+				prepared = append(prepared, current)
 				continue
 			}
 			if requester, ok := item.(tool.PermissionRequester); ok {
@@ -509,48 +627,33 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 				if requestErr != nil {
 					return requestErr
 				}
-				scope := permission.ScopeTurn
-				if decision == ApprovalAllowSession {
-					scope = permission.ScopeSession
-				}
-				if r.options.Permissions == nil {
-					return errors.New("permission manager is unavailable")
-				}
-				if _, grantErr := r.options.Permissions.Grant(request.Permissions, scope); grantErr != nil {
-					return fmt.Errorf("grant permissions: %w", grantErr)
+				if !permission.Empty(request.Permissions) {
+					scope := permission.ScopeTurn
+					if decision == ApprovalAllowSession {
+						scope = permission.ScopeSession
+					}
+					if r.options.Permissions == nil {
+						return errors.New("permission manager is unavailable")
+					}
+					if _, grantErr := r.options.Permissions.Grant(request.Permissions, scope); grantErr != nil {
+						return fmt.Errorf("grant permissions: %w", grantErr)
+					}
 				}
 			}
+			if !parallelBatch {
+				if err := executeAndCommit(&current); err != nil {
+					return err
+				}
+			}
+			prepared = append(prepared, current)
+		}
 
-			executeContext := tool.WithProgressReporter(ctx, func(progress tool.Progress) {
-				callCopy := call
-				r.emit(ctx, events, Event{Type: EventToolOutputDelta, Call: &callCopy, Delta: progress.Delta, SessionID: progress.SessionID})
-			})
-			result, executeErr := item.Execute(executeContext, call.Arguments)
-			if executeErr != nil {
-				result.IsError = true
-				if result.Content == "" {
-					result.Content = executeErr.Error()
-				} else {
-					result.Content += "\nError: " + executeErr.Error()
+		if parallelBatch {
+			r.executePreparedCalls(ctx, events, prepared)
+			for index := range prepared {
+				if err := commitPrepared(&prepared[index]); err != nil {
+					return err
 				}
-			}
-			result.Content = boundToolContent(result.Content, r.options.ToolOutputTokens)
-			if call.Name == "tool_search" {
-				if added := activateSearchedDefinitions(result.Content, definitionByName, enabledDefinitions, &definitions); added {
-					definitionTokens = estimateDefinitionTokens(definitions)
-				}
-			}
-			if r.options.Hook != nil {
-				if _, hookErr := r.options.Hook(ctx, HookPostToolUse, HookInput{Call: &call, Risk: risk, Category: category, Result: &result}); hookErr != nil {
-					return hookErr
-				}
-			}
-			conversation = append(conversation, toolMessage(call.ID, result))
-			if len(result.Images) > 0 {
-				returnedImages = append(returnedImages, result.Images...)
-			}
-			if !r.emit(ctx, events, Event{Type: EventToolFinished, Call: &call, Risk: risk, Result: &result}) {
-				return ctx.Err()
 			}
 		}
 		if len(returnedImages) > 0 {
@@ -561,6 +664,116 @@ func (r *Runner) run(ctx context.Context, input Input, events chan<- Event, stee
 		r.commitSteers(ctx, events, steer, &conversation)
 	}
 	return fmt.Errorf("agent stopped after reaching the configured %d-turn limit; set max_turns to 0 for no turn limit", r.options.MaxTurns)
+}
+
+func validateReturnedToolImages(images []provider.Image, previousCount int, previousBytes int64, maxCount int, maxBytes int64) (int64, error) {
+	if len(images) > maxCount-previousCount {
+		return 0, fmt.Errorf("tool-returned images exceed the aggregate %d-image limit", maxCount)
+	}
+	var added int64
+	for _, image := range images {
+		if image.Data == "" {
+			continue
+		}
+		decoded := base64DecodedLength(image.Data)
+		if decoded > maxBytes-previousBytes-added {
+			return 0, fmt.Errorf("tool-returned images exceed the aggregate %d MiB decoded-data limit", maxBytes/(1024*1024))
+		}
+		added += decoded
+	}
+	return added, nil
+}
+
+func base64DecodedLength(value string) int64 {
+	decoded := int64(base64.StdEncoding.DecodedLen(len(value)))
+	if strings.HasSuffix(value, "=") {
+		decoded--
+	}
+	if strings.HasSuffix(value, "==") {
+		decoded--
+	}
+	return max(0, decoded)
+}
+
+type preparedToolCall struct {
+	call     provider.ToolCall
+	item     tool.Tool
+	risk     tool.Risk
+	category tool.Category
+	result   tool.Result
+	executed bool
+	finished bool
+}
+
+const parallelToolLimit = 8
+
+func (r *Runner) executePreparedCalls(ctx context.Context, events chan<- Event, calls []preparedToolCall) {
+	executable := make([]int, 0, len(calls))
+	parallel := true
+	for index := range calls {
+		if calls[index].item == nil || calls[index].finished {
+			continue
+		}
+		executable = append(executable, index)
+		if !tool.CanRunInParallel(calls[index].item, calls[index].call.Arguments) {
+			parallel = false
+		}
+	}
+	execute := func(index int) {
+		current := &calls[index]
+		executeContext := tool.WithProgressReporter(ctx, func(progress tool.Progress) {
+			callCopy := current.call
+			r.emit(ctx, events, Event{Type: EventToolOutputDelta, Call: &callCopy, Delta: progress.Delta, SessionID: progress.SessionID})
+		})
+		result, executeErr := current.item.Execute(executeContext, current.call.Arguments)
+		if executeErr != nil {
+			result.IsError = true
+			if result.Content == "" {
+				result.Content = executeErr.Error()
+			} else {
+				result.Content += "\nError: " + executeErr.Error()
+			}
+		}
+		result.Content = boundToolContent(result.Content, r.options.ToolOutputTokens)
+		current.result, current.executed, current.finished = result, true, true
+	}
+	executeWithSlot := func(index int) {
+		select {
+		case r.toolSlots <- struct{}{}:
+			defer func() { <-r.toolSlots }()
+			execute(index)
+		case <-ctx.Done():
+			calls[index].result = tool.Result{Content: ctx.Err().Error(), IsError: true}
+			calls[index].finished = true
+		}
+	}
+	if !parallel || len(executable) < 2 {
+		for _, index := range executable {
+			if parallel {
+				executeWithSlot(index)
+			} else {
+				execute(index)
+			}
+		}
+		return
+	}
+	jobs := make(chan int)
+	workers := min(len(executable), parallelToolLimit)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			for index := range jobs {
+				executeWithSlot(index)
+			}
+		}()
+	}
+	for _, index := range executable {
+		jobs <- index
+	}
+	close(jobs)
+	group.Wait()
 }
 
 func estimateDefinitionTokens(definitions []provider.ToolDefinition) int {
@@ -624,6 +837,11 @@ func (r *Runner) commitSteers(ctx context.Context, events chan<- Event, steer <-
 }
 
 func (r *Runner) approve(ctx context.Context, events chan<- Event, item tool.Tool, call provider.ToolCall, risk tool.Risk, category tool.Category, summary string) (ApprovalDecision, error) {
+	if r.options.Approval == ApprovalGranular {
+		if allowed, configured := r.options.ApprovalCategories[category]; configured && !allowed {
+			return ApprovalDeny, nil
+		}
+	}
 	// Workspace file tools already reject escaping paths and symlinks and apply
 	// changes atomically. They are the equivalent of a workspace-write grant and
 	// should not interrupt the user with an additional approval prompt.
@@ -632,11 +850,6 @@ func (r *Runner) approve(ctx context.Context, events chan<- Event, item tool.Too
 	}
 	if r.options.Approval == ApprovalNever {
 		return ApprovalDeny, nil
-	}
-	if r.options.Approval == ApprovalGranular {
-		if allowed, configured := r.options.ApprovalCategories[category]; configured && !allowed {
-			return ApprovalDeny, nil
-		}
 	}
 	if r.ruleAllowed(call) {
 		return ApprovalAllowOnce, nil
@@ -656,7 +869,9 @@ func (r *Runner) approve(ctx context.Context, events chan<- Event, item tool.Too
 		if err != nil {
 			return ApprovalDeny, err
 		}
-		permissions = &value
+		if !permission.Empty(value.Permissions) {
+			permissions = &value
+		}
 	}
 	request := newApprovalRequest(call, risk, category, summary, permissions)
 	if r.options.Policy != nil {

@@ -113,10 +113,12 @@ func openApplicationStores(ctx context.Context, configDirectory string, environm
 }
 
 func (s applicationStores) close() {
-	if s.hooks == nil {
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = s.hooks.Session(ctx, "session_end")
+	if s.memory != nil {
+		_ = s.memory.StopStartup(ctx)
+	}
+	if s.hooks != nil {
+		_ = s.hooks.Session(ctx, "session_end")
+	}
 }

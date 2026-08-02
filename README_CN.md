@@ -2,7 +2,7 @@
 
 [English](README.md) · [简体中文](README_CN.md)
 
-SuperCode 是一个本地优先的终端编码智能体（coding agent），体验参考 Claude Code 和 OpenCode。它的智能体循环与具体厂商解耦，底层基于 OpenAI 官方 Go SDK 与 OpenAI 兼容的 Chat Completions 协议，因此 DeepSeek 等自定义端点也能使用流式文本和工具调用，而应用的其他部分不需要绑定某个特定 SDK。
+SuperCode 是一个本地优先的终端编码智能体（coding agent），体验参考 Claude Code 和 OpenCode。它的智能体循环与具体厂商解耦，通过官方 Go SDK 支持 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 和 OpenRouter，并能跨多个已配置端点使用流式文本与工具调用。
 
 当前 v1 已包含：工作区范围内的编码工具、原子化多文件编辑、持久化 PTY 进程、多模态图片检查、经审批的联网访问、递归子智能体协作、结构化计划与目标、运行中消息引导（steering）、崩溃可恢复的会话、MCP 服务器、生命周期钩子、本地插件、`SKILL.md` 激活、有界长期记忆、斜杠命令，以及带实时 Markdown 渲染的独立全屏终端界面。
 
@@ -53,9 +53,10 @@ alternate_screen: true
 go run . chat
 ```
 
-界面基于 Bubble Tea、Bubbles、Lip Gloss 和 Glamour 构建。默认进入备用屏幕（alternate-screen）页面，退出时恢复之前的 shell 页面。鼠标上报保持关闭，因此文本可以正常选中复制。标准终端的 alternate-scroll 模式在输入框为空时把鼠标滚轮映射到转录滚动；`PgUp`/`PgDn` 始终以确定性的方式滚动 SuperCode 对话。可以使用 `--no-alt-screen` 或 `alternate_screen: false` 改用终端原生的持久回滚。用户消息显示为灰色 `> message` 块；助手回复在流式期间以 GFM 兼容的终端 Markdown 渲染，不带角色标签。工具活动使用专用的工具视图：命令显示为 `Running`、`Ran` 或实时进程会话；搜索包含查询词和搜索路径/glob；编辑渲染完整、不截断的行级 `Added`/`Edited`/`Deleted`/`Moved` diff；Plan、Web、Goal、图片、会话和子智能体工具都显示有用的字段，而不是原始 JSON。
+界面基于 Bubble Tea、Bubbles、Lip Gloss 和 Glamour 构建。默认进入备用屏幕（alternate-screen）页面，退出时恢复之前的 shell 页面。鼠标上报保持关闭，因此文本可以正常选中复制。标准终端的 alternate-scroll 模式在输入框为空时把鼠标滚轮映射到转录滚动；`PgUp`/`PgDn` 始终以确定性的方式滚动 SuperCode 对话。可以使用 `--no-alt-screen` 或 `alternate_screen: false` 改用终端原生的持久回滚。用户消息显示为灰色 `> message` 块；助手回复在流式期间以 GFM 兼容的终端 Markdown 渲染，完成后仍保持渲染结果，不带角色标签。流式增量会合并为很短的显示帧，长 Markdown 和代码回复不会再按每个 token 重绘。工具活动使用专用的工具视图：命令显示为 `Running`、`Ran` 或实时进程会话；搜索包含查询词和搜索路径/glob；编辑渲染完整、不截断的行级 `Added`/`Edited`/`Deleted`/`Moved` diff；Plan、Web、Goal、图片、会话和子智能体工具都显示有用的字段，而不是原始 JSON。
 
 - `Enter`：发送消息；`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 插入换行
+- `↑` / `↓`：优先在多行草稿内移动；到达首行或末行后，可调出最近 100 条已提交输入（包括已加载会话的提示词），回到最新位置时恢复当前草稿
 - `Esc`：停止当前模型/工具流，保留部分输出，把焦点还给输入框
 - `Ctrl+G` 或 `/editor`：在 `$VISUAL` 或 `$EDITOR` 中编辑当前草稿
 - 输入 `/` 打开可搜索的命令菜单；使用 `↑`/`↓`、`Tab` 和 `Enter`
@@ -88,7 +89,7 @@ go run . chat
 - `/forget [text]`：排队一次记忆删除或更正以用于合并
 - `/queue`：检查当前轮次期间排队的引导消息
 - `/help`：显示分组、Markdown 渲染的命令帮助
-- `/exit`、`/quit` 或 `Ctrl+C`：退出
+- `/exit`、`/quit` 或 `Ctrl+C`：开始优雅退出，先停止当前轮次并保存会话；当 `memory_generate: true` 时，还会把当前会话处理进长期记忆。保存进度会留在界面上；再次按 `Ctrl+C` 可强制退出。
 
 全屏和内联模式都关闭了鼠标上报，普通拖拽选择仍然可用。当终端剪贴板行为异常时，`/copy` 和 `/raw` 是可靠的替代方案。
 
@@ -98,7 +99,7 @@ go run . chat
 
 在智能体轮次运行期间输入仍然可用。按 `Enter` 会把消息排队到 **Messages to be submitted after next tool call**。消息会在当前工具调用批次之后插入，或者在模型未调用工具就结束时作为后续消息提交。轮次期间输入 `/queue` 可检查排队的消息。
 
-已完成的轮次保存在 `~/.supercode/sessions/` 下。`index.json` 提供可搜索的元数据和全文路由，不依赖 SQLite；快照仍然是权威 JSON 文件。追加式 JSONL 事件提供崩溃恢复，归档日志压缩为 `.jsonl.gz`，图片输入按内容寻址存储在 `assets/<session-id>/` 下，因此多模态会话恢复时不会丢失图片。存储会检测遗留或外部写入的快照，并能在不删除无效文件的情况下重建索引。跨会话记忆位于 `~/.supercode/memories/`；历史 `~/.supercode/memory.md` 会被一次性迁移为显式笔记。文件使用本地模式 `0600`，所在目录使用 `0700`。
+已完成的轮次保存在 `~/.supercode/sessions/` 下。`index.json` 提供增量更新的可搜索元数据和全文路由，不依赖 SQLite。新增消息写入带序号的 JSONL 预写日志；当增量数量或 WAL 大小达到自适应阈值时，再刷新权威 JSON 快照。恢复只重放比快照新的记录，能修复末尾未写完的一行，并会明确报告中间损坏，而不是静默丢弃。快照已覆盖的 WAL 段会压缩为 `.jsonl.gz`。这既限制了快照写放大，也保留了崩溃恢复以及对旧式完整 `checkpoint` 事件的兼容。图片输入按内容寻址存储在 `assets/<session-id>/` 下，因此多模态会话恢复时不会丢失图片。跨进程锁避免并发写入丢失修订，索引可以从快照和 WAL 重建而不删除无效文件。跨会话记忆位于 `~/.supercode/memories/`；历史 `~/.supercode/memory.md` 会被一次性迁移为显式笔记。文件使用本地模式 `0600`，所在目录使用 `0700`。
 
 ## 编码工具与审批
 
@@ -122,17 +123,17 @@ go run . chat
 | `memories_search` / `memories_read` / `memories_list` | 搜索、读取或列出公开的长期 Markdown 记忆 | 自动只读 |
 | `memories_add_ad_hoc_note` | 排队一条显式请求的记住/忘记/更新笔记 | 作为写入询问 |
 | `tool_search` | 搜索并延迟启用 MCP 工具 | 自动 |
-| `mcp__<server>__<tool>` | 调用动态发现的 MCP 工具 | 只读注解自动；其他询问 |
+| `mcp__<server>__<tool>` | 调用动态发现的 MCP 工具 | 默认总是询问；不把远端注解当作审批边界 |
 | `update_plan` | 更新结构化任务计划 | 自动 |
 | `create_goal` / `get_goal` / `update_goal` | 管理显式请求的长期目标 | 自动 |
 | `spawn_agent` / `send_message` / `followup_task` | 启动或引导有界子智能体 | 自动编排 |
 | `interrupt_agent` / `list_agents` / `wait_agent` | 控制和观察子智能体 | 自动编排 |
 
-文件工具拒绝逃逸已配置根目录的路径和符号链接。工具输出有界，命令有超时，智能体运行可使用可配置的模型轮次上限（`0` 表示不限）。`exec_command`、`write_stdin` 和 `wait` 在完成前把进程增量流式写入活动的工具卡片，同时为模型保留最终的受限观察结果。`exec_command` 把长时间运行的进程保持在会话中，以便后续调用继续。`view_image` 通过厂商无关的消息模型返回图片输入。`web__run` 默认阻止私网、loopback、link-local 和非 HTTP 目标。
+文件工具拒绝逃逸已配置根目录的路径和符号链接。工具输出有界，命令有超时，智能体运行可使用可配置的模型轮次上限（`0` 表示不限）。显式声明并行安全的独立工具——例如工作区读取和类型明确的 MCP Resource/Prompt 读取——会在进程级八路上限内并发运行，同时仍按模型调用顺序提交结果；有状态读取以及全部写入/执行操作保持有序。动态远端 MCP 工具无论服务器注解如何都会保持有序并经过审批。`exec_command`、`write_stdin` 和 `wait` 在完成前把进程增量流式写入活动的工具卡片，同时为模型保留滚动的最新 1 MiB 作为最终受限观察结果；即使超过保留窗口，实时流也不会停止。`exec_command` 把长时间运行的进程保持在会话中，以便后续调用继续；取消或关闭时会终止整棵进程树。`view_image` 通过厂商无关的消息模型返回图片输入。`web__run` 默认阻止私网、loopback、link-local、组播、非全局单播和非 HTTP 目标；执行时会再次校验实际端点及每次重定向，页面缓存也按字节设限。
 
 在 Linux 上，SuperCode 启动时探测 Bubblewrap。可用时，shell 命令看到的主机文件系统是只读的，已配置的写根目录会重新挂载为可写，拒绝根目录以及 `.git` 和 `.supercode` 保持受保护，`/tmp` 是临时的，进程运行在独立的用户和 PID 命名空间中。可以通过 YAML 配置额外的 `read_roots`、`write_roots` 和 `deny_roots`。主机允许时启用网络命名空间。如果主机无法隔离网络，只有一组保守的非联网只读命令可以跳过审批；其他所有命令都需要批准。`sandbox_permissions: require-escalated` 在批准后、且必须提供理由时才在该边界之外运行。macOS 和 Windows 会在 `/status` 中明确报告仅审批的降级模式；它们永远不会被错误标称为等效的原生沙箱。
 
-默认的 `on-request` 策略把已验证的工作区文件编辑当作 workspace-write 操作：不需要第二次确认。非只读 shell 命令、网络请求、无注解的 MCP 调用和进程终止使用审批卡片。`request_permissions` 可以为本轮或本会话添加规范的文件系统根目录和 URL 感知的网络授权。域名授权不会禁用 shell 网络隔离；只有显式的 `*` 协议加 `*` 域名授权才能做到。`granular` 遵循 `approval_categories`，对配置为 `false` 的类别默认拒绝；`always` 允许所有请求，`never` 拒绝所有请求。在非交互模式下，未解决的审批会被拒绝；只在可信工作区和模型端点下使用 `--approval always`。
+默认的 `on-request` 策略把已验证的工作区文件编辑当作 workspace-write 操作：不需要第二次确认。非只读 shell 命令、网络请求、动态远端 MCP 工具调用和进程终止使用审批卡片。`request_permissions` 可以为本轮或本会话添加规范的文件系统根目录和 URL 感知的网络授权。域名授权不会禁用 shell 网络隔离；只有显式的 `*` 协议加 `*` 域名授权才能做到。`granular` 遵循 `approval_categories`，对配置为 `false` 的类别默认拒绝；`always` 允许所有请求，`never` 拒绝所有请求。在非交互模式下，未解决的审批会被拒绝；只在可信工作区和模型端点下使用 `--approval always`。
 
 PDF 页面截图在可用时使用 Poppler 的 `pdftoppm` 可执行文件；其他 `web__run` 操作不需要它。
 
@@ -182,7 +183,7 @@ Inspect the diff, run focused checks, and report concrete findings.
   extensions/ad_hoc/notes/*.md       explicit remember/forget/update notes
 ```
 
-当 `memory_generate: true` 时，启动会运行一个有界的后台流水线。阶段 1 只考虑最近 10 天内、空闲至少 6 小时的非当前、非归档根会话，每次运行最多处理两个。它让配置的提取模型以低推理强度返回包含详细记忆和路由摘要的严格 JSON。阶段 2 按使用次数和新鲜度对最多 256 个成功提取进行排序，包含显式笔记，并让合并模型以中等推理强度生成 `MEMORY.md`、`memory_summary.md` 和可选的技能。空模型名使用当前聊天模型。输入和输出经过秘密脱敏，私有记忆目录维护自己的 Git 基线用于合并 diff。
+当 `memory_generate: true` 时，启动会运行一个有界的后台流水线。阶段 1 只考虑最近 10 天内、空闲至少 6 小时的非当前、非归档根会话，每次运行最多处理两个。TUI 优雅退出会先提交当前根会话，再忽略启动时的空闲阈值立即处理它；经过脱敏的内容哈希会在只有会话元数据变化时跳过重复工作。它让配置的提取模型以低推理强度返回包含详细记忆和路由摘要的严格 JSON。阶段 2 按使用次数和新鲜度对最多 256 个成功提取进行排序，包含显式笔记，并让合并模型以中等推理强度生成 `MEMORY.md`、`memory_summary.md` 和可选的技能。空模型名使用当前聊天模型。输入和输出经过秘密脱敏，私有记忆目录维护自己的 Git 基线用于合并 diff。
 
 只有截断到 `memory_max_tokens`（默认 2500）的 `memory_summary.md` 会注入普通轮次。模型按需使用专用只读工具搜索详细记忆。隐藏的记忆引用会从可见的流式输出中移除，并更新 `state.json` 中的 `usage_count` 和 `last_usage`，影响未来的合并优先级。`/remember` 和 `/forget` 创建追加式笔记；它们不直接重写生成的记忆。自动模型生成默认关闭以避免意外 API 成本，而使用已生成记忆默认开启。
 
@@ -190,9 +191,9 @@ Inspect the diff, run focused checks, and report concrete findings.
 
 ## 提示词架构
 
-SuperCode 使用嵌入的、厂商无关的提示词包。措辞根据 SuperCode 的 Chat Completions 客户端和工具契约做了调整。
+SuperCode 使用嵌入的、厂商无关的提示词包。措辞根据 SuperCode 的厂商无关模型边界和工具契约做了调整。
 
-稳定的会话指令包含编码智能体行为、沟通规则、工具纪律、项目指令、`apply_patch` 契约和多智能体编排策略。每轮指令追加活动协作模式、审批和沙箱状态、模型、日期、工作区、上下文预算、选中的技能、记忆、插件、钩子、MCP 服务器和活动目标。两层合并到可移植的 `Instructions` 字段中，作为一条 system 消息发送，因为 OpenAI 兼容的 Chat Completions 端点一致支持这种方式。
+稳定的会话指令包含编码智能体行为、沟通规则、工具纪律、项目指令、`apply_patch` 契约和多智能体编排策略。每轮指令追加活动协作模式、审批和沙箱状态、模型、日期、工作区、上下文预算、选中的技能、记忆、插件、钩子、MCP 服务器和活动目标。两层合并到可移植的 `Instructions` 字段中，每个 Provider 适配器再把它映射到对应 API 的原生指令或 system message 表示。
 
 `default`、`plan`、`execute` 和 `pair` 模式随会话持久化，可通过 `/mode` 更改。`/plan` 仍是进入或离开 Plan 模式、以及显示或隐藏结构化计划面板的快捷方式。Review、目标续跑、Apply Patch、多智能体编排、awaiter、记忆提取和记忆合并提示词都连接到匹配的客户端工作流。Compact 保持确定性和本地性；Guardian 和 Realtime 模板仍然是显式集成点，没有模型支持的运行时。
 
@@ -200,6 +201,8 @@ SuperCode 使用嵌入的、厂商无关的提示词包。措辞根据 SuperCode
 ## MCP、钩子与插件
 
 可信配置可以通过 stdio 或 Streamable HTTP 添加 MCP 服务器。协议协商、传输成帧、分页和类型化内容由官方 MCP Go SDK 处理。工具在启动时发现，命名为 `mcp__<server>__<tool>`。MCP 工具在 `tool_search` 选中它们之前不会进入模型请求，从而减少上下文使用。Resource 和 Prompt 能力作为服务器特定工具暴露。HTTP 凭据可以使用环境展开的请求头，或使用 `oauth_token_command`（其 stdout 提供 bearer token，而不存储在 YAML 中）。`supercode mcp status [name]` 连接服务器并报告可用性；`supercode mcp reload` 校验所有已启用的服务器；`supercode mcp login|logout <name> [...]` 配置或移除 OAuth token 命令。
+
+配置的 MCP 服务器会并发连接和发现工具，并分别应用启动超时。单个服务器失败时会显示警告，健康服务器仍可使用；`mcp status` 和 `mcp reload` 会报告全部失败项，并在校验不完整时返回错误。
 
 ```yaml
 mcp_servers:
@@ -235,7 +238,7 @@ hooks:
 
 用户配置目录使用模式 `0700`，文件使用 `0600`。正常启动期间永远不会覆盖现有配置内容。项目文件 `.supercode/config.yaml` 在显式启用 `--trust-project` 之前会被忽略；`/config` 或 `--config-diagnostics` 显示活动来源。信任按规范工作区路径存储，因此符号链接不能继承另一个项目的决策。
 
-API 密钥优先级为 `OPENAI_API_KEY`，然后是 `token_command`，再是 YAML `token`。`token_command` 直接执行参数向量，有五秒超时，并从 stdout 读取有界 token。它可以桥接 Secret Service、macOS Keychain、密码管理器或其他系统凭据助手。YAML token 保持为本地明文；留空更安全：
+对于旧式单端点配置，API 密钥优先级为 `OPENAI_API_KEY`，然后是 `token_command`，再是 YAML `token`。`token_command` 直接执行参数向量，有五秒超时，并从 stdout 读取有界 token。它可以桥接 Secret Service、macOS Keychain、密码管理器或其他系统凭据助手。YAML token 保持为本地明文；留空更安全：
 
 ```bash
 export OPENAI_API_KEY="your_api_key"
@@ -248,6 +251,8 @@ export OPENAI_API_KEY="your_api_key"
 | `OPENAI_API_KEY` | API token；覆盖 YAML `token` |
 | `OPENAI_BASE_URL` | API 基础 URL |
 | `OPENAI_MODEL` | 模型 ID |
+| `ANTHROPIC_API_KEY` | `anthropic` Provider 的默认密钥 |
+| `OPENROUTER_API_KEY` | `openrouter` Provider 的默认密钥 |
 | `SUPERCODE_STREAM` | 启用或禁用流式 |
 | `SUPERCODE_TIMEOUT` | 请求超时，例如 `30s` 或 `2m` |
 | `SUPERCODE_INSTRUCTIONS` | 开发者指令 |
@@ -332,6 +337,43 @@ go run . \
 
 配置的 token 会发送到这个 URL，因此只连接你信任的服务。兼容服务在启用流式时必须实现 OpenAI Chat Completions API 及其纯数据 SSE 格式。
 
+### 多 Provider
+
+使用 `providers` 在多个 URL 和协议之间选择模型：
+
+```yaml
+model: openai/gpt-4o
+providers:
+  - name: openai
+    provider: openai
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    models: [gpt-4o, gpt-4o-mini]
+  - name: responses
+    provider: openai_responses
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    models: [gpt-5-codex]
+  - name: anthropic
+    provider: anthropic
+    url: https://api.anthropic.com
+    token: ${ANTHROPIC_API_KEY}
+    maxTokens: 8192
+    models: [claude-sonnet-4-6, claude-opus-4-6]
+  - name: openrouter
+    provider: openrouter
+    url: https://openrouter.ai/api/v1
+    token: ${OPENROUTER_API_KEY}
+    models: [openai/gpt-4o, anthropic/claude-sonnet-4]
+    headers:
+      HTTP-Referer: https://example.com
+      X-OpenRouter-Title: SuperCode
+```
+
+每个 Provider 都可以配置自己的 `url`、`token` 和可选的 `token_command`；Provider 不会继承顶层端点凭据。`openai` 使用 `/chat/completions`，`openai_responses` 使用 `/responses`，`anthropic` 使用 `/v1/messages`，`openrouter` 使用 `/chat/completions`。Anthropic 的 `url` 末尾可以有或没有 `/v1`。`token: ${NAME}` 会解析指定环境变量；省略 `token` 时，各 Provider 默认读取 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 或 `OPENROUTER_API_KEY`。
+
+稳定的模型选择值是 `provider-name/model-id`，例如 `responses/gpt-5-codex`。模型 ID 唯一时也可使用不带 Provider 的写法；同名模型必须使用完整选择值。模型选择器显示为 `gpt-5-codex [in responses]`，Provider 后缀使用弱化颜色。旧式 `url`、`token` 和 `models` 配置仍作为单个 OpenAI 兼容 Chat Completions 端点受到支持。
+
 ## 非交互用法
 
 参数产生一次性请求：
@@ -398,6 +440,9 @@ internal/collaboration/       递归、持久化的子智能体生命周期
 internal/taskstate/           结构化计划和显式目标状态
 internal/provider/            厂商无关的请求、响应和流类型
 internal/provider/openai/     OpenAI 兼容的 Chat Completions 适配器
+internal/provider/openairesponses/ OpenAI Responses 适配器
+internal/provider/anthropic/  Anthropic Messages 适配器
+internal/provider/openrouter/ OpenRouter 适配器
 internal/session/             索引 JSON 快照、资产和压缩事件日志
 internal/skill/               SKILL.md 发现与精确本地路径注入
 internal/memory/              文件型提取、合并、检索和使用反馈

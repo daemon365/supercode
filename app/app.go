@@ -57,6 +57,9 @@ func Run(
 		return err
 	}
 	defer runtime.close()
+	for _, warning := range runtime.mcpWarnings {
+		_, _ = fmt.Fprintln(stderr, "supercode: warning:", warning)
+	}
 	return executeInvocation(ctx, executionContext{
 		environment: environment, stores: stores, runtime: runtime,
 		policyStore: policyStore, eventLogger: eventLogger,

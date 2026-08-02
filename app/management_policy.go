@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -75,14 +76,37 @@ func runDoctor(configPath, workspace string, fileConfig config.File, policyStore
 	} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		checks[0] = check{name: "Config", status: "WARN", detail: fmt.Sprintf("permissions are %04o; expected 0600", info.Mode().Perm())}
 	}
-	authConfigured := strings.TrimSpace(fileConfig.Token) != "" || len(fileConfig.TokenCommand) > 0
-	if token, ok := lookupEnv("OPENAI_API_KEY"); ok && strings.TrimSpace(token) != "" {
-		authConfigured = true
-	}
-	if authConfigured {
-		checks = append(checks, check{name: "Auth", status: "OK", detail: "API token source configured"})
+	if len(fileConfig.Providers) == 0 {
+		authConfigured := strings.TrimSpace(fileConfig.Token) != "" || len(fileConfig.TokenCommand) > 0
+		if token, ok := lookupEnv("OPENAI_API_KEY"); ok && strings.TrimSpace(token) != "" {
+			authConfigured = true
+		}
+		if authConfigured {
+			checks = append(checks, check{name: "Auth", status: "OK", detail: "API token source configured"})
+		} else {
+			checks = append(checks, check{name: "Auth", status: "WARN", detail: "OPENAI_API_KEY, token, or token_command is required before a model call"})
+		}
 	} else {
-		checks = append(checks, check{name: "Auth", status: "WARN", detail: "OPENAI_API_KEY, token, or token_command is required before a model call"})
+		for _, providerConfig := range fileConfig.Providers {
+			environmentName := providerAPIKeyEnvironment(providerConfig)
+			hasEnvironment := false
+			if value, ok := lookupEnv(environmentName); ok && strings.TrimSpace(value) != "" {
+				hasEnvironment = true
+			}
+			if explicit := providerTokenReference(providerConfig.Token); explicit != "" {
+				environmentName = explicit
+				value, ok := lookupEnv(explicit)
+				hasEnvironment = ok && strings.TrimSpace(value) != ""
+			}
+			configured := hasEnvironment || strings.TrimSpace(providerConfig.Token) != "" && providerTokenReference(providerConfig.Token) == "" || len(providerConfig.TokenCommand) > 0
+			status, source := "WARN", "no API key source configured"
+			if configured {
+				status, source = "OK", "API key source configured"
+			} else if environmentName != "" {
+				source = environmentName + " or provider token/token_command is required"
+			}
+			checks = append(checks, check{name: "Provider", status: status, detail: fmt.Sprintf("%s (%s, %d model(s)): %s", providerConfig.Name, providerConfig.Provider, len(providerConfig.Models), source)})
+		}
 	}
 	sandboxOptions := tool.SandboxOptions{ReadRoots: fileConfig.ReadRoots, WriteRoots: fileConfig.WriteRoots, DenyRoots: fileConfig.DenyRoots}
 	sandboxStatus := tool.SandboxStatusWithOptions(workspace, sandboxOptions)
@@ -134,17 +158,31 @@ func exportDiagnostics(path, configPath, workspace string, configuration config.
 	if err := runDoctor(configPath, workspace, configuration, policyStore, &doctor, lookupEnv); err != nil {
 		return err
 	}
-	configuration.Token = "[redacted]"
-	configuration.TokenCommand = nil
-	for name, server := range configuration.MCPServers {
-		for key := range server.Headers {
-			if strings.Contains(strings.ToLower(key), "authorization") || strings.Contains(strings.ToLower(key), "token") {
-				server.Headers[key] = "[redacted]"
-			}
-		}
-		server.OAuthTokenCommand = nil
-		configuration.MCPServers[name] = server
+	if configuration.Token != "" {
+		configuration.Token = "[redacted]"
 	}
+	configuration.TokenCommand = nil
+	redactedProviders := make([]config.ProviderConfig, len(configuration.Providers))
+	for index, providerConfig := range configuration.Providers {
+		redactedProviders[index] = providerConfig
+		if providerConfig.Token != "" {
+			redactedProviders[index].Token = "[redacted]"
+		}
+		redactedProviders[index].TokenCommand = nil
+		redactedProviders[index].URL = redactEndpoint(providerConfig.URL)
+		redactedProviders[index].Headers = redactValues(providerConfig.Headers)
+		redactedProviders[index].Models = append([]string(nil), providerConfig.Models...)
+	}
+	configuration.Providers = redactedProviders
+	redactedServers := make(map[string]config.MCPServer, len(configuration.MCPServers))
+	for name, server := range configuration.MCPServers {
+		server.Env = redactValues(server.Env)
+		server.Headers = redactValues(server.Headers)
+		server.URL = redactEndpoint(server.URL)
+		server.OAuthTokenCommand = nil
+		redactedServers[name] = server
+	}
+	configuration.MCPServers = redactedServers
 	redactedConfig, err := yaml.Marshal(configuration)
 	if err != nil {
 		return err
@@ -187,4 +225,47 @@ func exportDiagnostics(path, configPath, workspace string, configuration config.
 	}
 	_, err = fmt.Fprintln(output, "Wrote redacted diagnostics to "+path+".")
 	return err
+}
+
+func providerAPIKeyEnvironment(configuration config.ProviderConfig) string {
+	switch strings.ToLower(strings.TrimSpace(configuration.Provider)) {
+	case "anthropic":
+		return "ANTHROPIC_API_KEY"
+	case "openrouter":
+		return "OPENROUTER_API_KEY"
+	default:
+		return "OPENAI_API_KEY"
+	}
+}
+
+func providerTokenReference(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "${") && strings.HasSuffix(value, "}") && strings.Count(value, "${") == 1 {
+		return strings.TrimSpace(value[2 : len(value)-1])
+	}
+	return ""
+}
+
+func redactValues(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	redacted := make(map[string]string, len(values))
+	for key := range values {
+		redacted[key] = "[redacted]"
+	}
+	return redacted
+}
+
+func redactEndpoint(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		if strings.TrimSpace(value) == "" {
+			return ""
+		}
+		return "[redacted-url]"
+	}
+	// Endpoint paths can themselves contain bearer tokens or tenant secrets.
+	// Diagnostics only need the transport and host to identify the server.
+	return parsed.Scheme + "://" + parsed.Host + "/[redacted]"
 }

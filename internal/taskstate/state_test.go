@@ -2,11 +2,23 @@ package taskstate
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/daemon365/supercode/internal/provider"
 )
+
+func TestGetGoalSchemaDeclaresProperties(t *testing.T) {
+	var schema map[string]json.RawMessage
+	if err := json.Unmarshal((&getGoalTool{}).Definition().Parameters, &schema); err != nil {
+		t.Fatal(err)
+	}
+	properties, exists := schema["properties"]
+	if !exists || string(properties) != "{}" {
+		t.Fatalf("properties = %s, want {}", properties)
+	}
+}
 
 func TestPlanAndGoalTools(t *testing.T) {
 	state := New(Plan{}, nil)

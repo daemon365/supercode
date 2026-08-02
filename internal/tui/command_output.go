@@ -5,8 +5,6 @@ import (
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
-
-	"github.com/daemon365/supercode/internal/session"
 )
 
 func (m model) commandOutput(invocation slashInvocation) (tea.Model, tea.Cmd) {
@@ -26,11 +24,10 @@ func (m model) commandOutput(invocation slashInvocation) (tea.Model, tea.Cmd) {
 			m.addError("There is no " + target + " output to copy. Usage: /copy [assistant|tool|transcript|all]")
 			break
 		}
-		if err := writeClipboard(content); err != nil {
-			m.addError("Clipboard is unavailable: " + err.Error())
-			break
+		m.runtimeJobs++
+		return m, func() tea.Msg {
+			return clipboardWrittenMsg{target: target, err: writeClipboard(content)}
 		}
-		m.addStatus("Copied " + target + " output.")
 	case "/queue":
 		m.addStatus(m.queueSummary())
 	case "/raw":
@@ -39,6 +36,10 @@ func (m model) commandOutput(invocation slashInvocation) (tea.Model, tea.Cmd) {
 		m.refreshMessages(false)
 	case "/markdown":
 		m.rawMode = !m.rawMode
+		m.resetTranscriptCache()
+		for index := range m.messages {
+			m.messages[index].rendered = ""
+		}
 		m.refreshMessages(false)
 		m.addStatus(fmt.Sprintf("Markdown rendering: %t.", !m.rawMode))
 	}
@@ -53,15 +54,15 @@ func (m model) commandMemoryAndResume(invocation slashInvocation) (tea.Model, te
 			m.addError("Memory storage is unavailable.")
 			break
 		}
-		value, err := m.memory.Summary()
-		if err != nil {
-			m.addError(err.Error())
-			break
+		store := m.memory
+		m.runtimeJobs++
+		return m, func() tea.Msg {
+			summary, err := store.Summary()
+			if summary == "" {
+				summary = "Memory summary is empty."
+			}
+			return memoryCommandMsg{action: "summary", content: store.Status() + "\n\nSummary\n" + summary, err: err}
 		}
-		if value == "" {
-			value = "Memory summary is empty."
-		}
-		m.addStatus(m.memory.Status() + "\n\nSummary\n" + value)
 	case "/remember":
 		if m.memory == nil {
 			m.addError("Memory storage is unavailable.")
@@ -72,46 +73,48 @@ func (m model) commandMemoryAndResume(invocation slashInvocation) (tea.Model, te
 			break
 		}
 		text := strings.TrimSpace(strings.TrimPrefix(value, fields[0]))
-		if err := m.memory.Remember(text); err != nil {
-			m.addError(err.Error())
-			break
+		store := m.memory
+		m.runtimeJobs++
+		return m, func() tea.Msg {
+			err := store.Remember(text)
+			return memoryCommandMsg{action: "remember", content: "Queued an explicit note for the next memory consolidation.", err: err}
 		}
-		m.addStatus("Queued an explicit note for the next memory consolidation.")
 	case "/forget":
 		if m.memory == nil {
 			m.addError("Memory storage is unavailable.")
 			break
 		}
 		text := strings.TrimSpace(strings.TrimPrefix(value, fields[0]))
-		if err := m.memory.Forget(text); err != nil {
-			m.addError(err.Error())
-			break
+		store := m.memory
+		m.runtimeJobs++
+		return m, func() tea.Msg {
+			err := store.Forget(text)
+			return memoryCommandMsg{action: "forget", content: "Queued a forget/update note for the next memory consolidation.", err: err}
 		}
-		m.addStatus("Queued a forget/update note for the next memory consolidation.")
 	case "/sessions":
 		includeArchived := len(fields) > 1 && strings.EqualFold(fields[1], "all")
-		m.openSessionPicker(includeArchived)
+		return m, m.openSessionPicker(includeArchived)
 	case "/resume":
 		if m.store == nil {
 			m.addError("Session storage is unavailable.")
 			break
 		}
 		if len(fields) < 2 {
-			m.openSessionPicker(false)
-			break
+			return m, m.openSessionPicker(false)
 		}
-		var loaded session.Session
-		var err error
+		store := m.store
 		if fields[1] == "latest" {
-			loaded, err = m.store.Latest(m.options.Workspace)
-		} else {
-			loaded, err = m.store.Load(fields[1])
+			workspace := m.options.Workspace
+			return m, m.enqueueSessionJob(sessionJob{action: sessionActionLoadLatest, blocking: true, run: func() sessionJobResult {
+				loaded, err := store.Latest(workspace)
+				return sessionJobResult{action: sessionActionLoadLatest, value: loaded, err: err}
+			}})
 		}
-		if err != nil {
-			m.addError(err.Error())
-			break
-		}
-		m.resumeSession(loaded)
+		id := fields[1]
+		return m, m.enqueueSessionJob(sessionJob{action: sessionActionLoad, blocking: true, run: func() sessionJobResult {
+			loaded, err := store.Load(id)
+			return sessionJobResult{action: sessionActionLoad, value: loaded, err: err}
+		}})
 	}
 	return m, nil
 }

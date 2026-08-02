@@ -24,18 +24,34 @@ type Manager struct {
 	tasks         map[string]*task
 	maxConcurrent int
 	maxDepth      int
+	nextSequence  uint64
+	shuttingDown  bool
+	transitioning bool
 }
 type task struct {
 	name, status string
 	role, model  string
 	reasoning    string
+	ctx          context.Context
 	cancel       context.CancelFunc
 	run          *agent.RunHandle
 	history      []provider.Message
-	output       strings.Builder
+	output       string
 	err          error
 	done         chan struct{}
+	sequence     uint64
+	interrupted  bool
 }
+
+const (
+	maxStoredTasks       = 128
+	maxTaskOutputBytes   = 128 * 1024
+	maxTaskHistoryTokens = 64 * 1024
+	maxTaskHistoryBytes  = 1024 * 1024
+	maxTaskImageBytes    = 128 * 1024
+	maxSnapshotBytes     = 8 * 1024 * 1024
+	maxSnapshotError     = 8 * 1024
+)
 
 type persistedTask struct {
 	Name      string             `json:"name"`
@@ -73,38 +89,110 @@ func (m *Manager) Snapshot() json.RawMessage {
 		return nil
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	values := make([]persistedTask, 0, len(m.tasks))
+	type candidate struct {
+		sequence uint64
+		value    persistedTask
+		encoded  json.RawMessage
+	}
+	candidates := make([]candidate, 0, len(m.tasks))
 	for _, item := range m.tasks {
 		value := persistedTask{
 			Name: item.name, Status: item.status, Role: item.role, Model: item.model,
-			Reasoning: item.reasoning, History: append([]provider.Message(nil), item.history...), Output: item.output.String(),
+			Reasoning: item.reasoning, History: append([]provider.Message(nil), item.history...), Output: item.output,
 		}
 		if item.err != nil {
-			value.Error = item.err.Error()
+			value.Error = boundTaskField(item.err.Error(), maxSnapshotError)
 		}
-		values = append(values, value)
+		candidates = append(candidates, candidate{sequence: item.sequence, value: value})
 	}
-	sort.Slice(values, func(i, j int) bool { return values[i].Name < values[j].Name })
+	m.mu.Unlock()
+
+	// Preserve metadata for every task first, then spend the remaining budget
+	// on the newest task histories and outputs. This makes persistence bounded
+	// without hiding the existence/status of older tasks in normal operation.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].sequence > candidates[j].sequence })
+	selected := make([]candidate, 0, len(candidates))
+	total := 2 // JSON array brackets.
+	for _, item := range candidates {
+		metadata := item.value
+		metadata.History = nil
+		metadata.Output = ""
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			continue
+		}
+		extra := len(encoded)
+		if len(selected) > 0 {
+			extra++
+		}
+		if total+extra > maxSnapshotBytes {
+			continue
+		}
+		item.encoded = encoded
+		selected = append(selected, item)
+		total += extra
+	}
+	for index := range selected {
+		full, err := json.Marshal(selected[index].value)
+		if err != nil {
+			continue
+		}
+		if total-len(selected[index].encoded)+len(full) <= maxSnapshotBytes {
+			total += len(full) - len(selected[index].encoded)
+			selected[index].encoded = full
+			continue
+		}
+		historyOnly := selected[index].value
+		historyOnly.Output = ""
+		if encoded, marshalErr := json.Marshal(historyOnly); marshalErr == nil && total-len(selected[index].encoded)+len(encoded) <= maxSnapshotBytes {
+			total += len(encoded) - len(selected[index].encoded)
+			selected[index].encoded = encoded
+			continue
+		}
+		outputOnly := selected[index].value
+		outputOnly.History = nil
+		if encoded, marshalErr := json.Marshal(outputOnly); marshalErr == nil && total-len(selected[index].encoded)+len(encoded) <= maxSnapshotBytes {
+			total += len(encoded) - len(selected[index].encoded)
+			selected[index].encoded = encoded
+		}
+	}
+	sort.Slice(selected, func(i, j int) bool { return selected[i].value.Name < selected[j].value.Name })
+	values := make([]json.RawMessage, len(selected))
+	for index := range selected {
+		values[index] = selected[index].encoded
+	}
 	encoded, _ := json.Marshal(values)
 	return encoded
 }
 
 func (m *Manager) Restore(data json.RawMessage) error {
-	if m == nil || len(data) == 0 {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.RestoreContext(ctx, data)
+}
+
+// RestoreContext cancels and joins tasks from the previous session before
+// atomically replacing the persisted task set.
+func (m *Manager) RestoreContext(ctx context.Context, data json.RawMessage) error {
+	if m == nil {
 		return nil
+	}
+	if len(data) == 0 {
+		data = json.RawMessage(`[]`)
 	}
 	var values []persistedTask
 	if err := json.Unmarshal(data, &values); err != nil {
 		return fmt.Errorf("restore sub-agents: %w", err)
 	}
+	if len(values) > maxStoredTasks {
+		values = values[len(values)-maxStoredTasks:]
+	}
+	if err := m.beginTransition(ctx); err != nil {
+		return fmt.Errorf("stop previous sub-agents: %w", err)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, existing := range m.tasks {
-		if existing.status == "running" {
-			existing.cancel()
-		}
-	}
+	m.transitioning = false
 	m.tasks = make(map[string]*task, len(values))
 	for _, value := range values {
 		if !validPath(value.Name) {
@@ -115,15 +203,93 @@ func (m *Manager) Restore(data json.RawMessage) error {
 			status = "interrupted"
 		}
 		item := &task{
-			name: value.Name, status: status, role: value.Role, model: value.Model, reasoning: value.Reasoning,
-			history: append([]provider.Message(nil), value.History...), done: make(chan struct{}),
+			name: value.Name, status: status,
+			role: boundTaskField(value.Role, 4*1024), model: boundTaskField(value.Model, 512), reasoning: boundTaskField(value.Reasoning, 64),
+			history: boundedTaskHistory(value.History), output: boundTaskOutput(value.Output), done: make(chan struct{}),
 		}
-		item.output.WriteString(value.Output)
+		m.nextSequence++
+		item.sequence = m.nextSequence
 		if value.Error != "" {
-			item.err = errors.New(value.Error)
+			item.err = errors.New(boundTaskField(value.Error, 64*1024))
 		}
 		close(item.done)
 		m.tasks[item.name] = item
+	}
+	return nil
+}
+
+// Quiesce cancels and joins active tasks while keeping their final state and
+// allowing the manager to be reused. Session switches use it to take a durable
+// snapshot before replacing the task set.
+func (m *Manager) Quiesce(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	if err := m.beginTransition(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.transitioning = false
+	m.mu.Unlock()
+	return nil
+}
+
+// Shutdown prevents new sub-agents, interrupts all active tasks, and joins
+// their consumers without holding the manager lock while waiting.
+func (m *Manager) Shutdown(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	m.shuttingDown = true
+	done := m.interruptRunningLocked()
+	m.mu.Unlock()
+	return waitTasks(ctx, done)
+}
+
+func (m *Manager) beginTransition(ctx context.Context) error {
+	m.mu.Lock()
+	if m.shuttingDown {
+		m.mu.Unlock()
+		return errors.New("sub-agent manager is shutting down")
+	}
+	m.transitioning = true
+	done := m.interruptRunningLocked()
+	m.mu.Unlock()
+	if err := waitTasks(ctx, done); err != nil {
+		m.mu.Lock()
+		m.transitioning = false
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) interruptRunningLocked() []<-chan struct{} {
+	done := make([]<-chan struct{}, 0, len(m.tasks))
+	for _, item := range m.tasks {
+		select {
+		case <-item.done:
+			continue
+		default:
+		}
+		item.interrupted = true
+		item.status = "interrupted"
+		if item.cancel != nil {
+			item.cancel()
+		}
+		done = append(done, item.done)
+	}
+	return done
+}
+
+func waitTasks(ctx context.Context, tasks []<-chan struct{}) error {
+	for _, done := range tasks {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return nil
 }
@@ -140,6 +306,10 @@ func (m *Manager) start(parent, name, prompt, role, model, reasoning string, his
 		return fmt.Errorf("sub-agent depth limit of %d reached", m.maxDepth)
 	}
 	m.mu.Lock()
+	if m.shuttingDown || m.transitioning {
+		m.mu.Unlock()
+		return errors.New("sub-agent manager is unavailable during shutdown or session restore")
+	}
 	if existing := m.tasks[path]; existing != nil && existing.status == "running" {
 		m.mu.Unlock()
 		return errors.New("agent is already running")
@@ -154,14 +324,22 @@ func (m *Manager) start(parent, name, prompt, role, model, reasoning string, his
 		m.mu.Unlock()
 		return errors.New("sub-agent concurrency limit reached")
 	}
-	subRunner, err := m.runner.Fork(model, agent.ApprovalNever)
+	if existing := m.tasks[path]; existing == nil && len(m.tasks) >= maxStoredTasks && !m.pruneOldestLocked() {
+		m.mu.Unlock()
+		return errors.New("sub-agent task history limit reached")
+	}
+	subRunner, err := m.runner.ForkConfigured(model, agent.ApprovalNever, reasoning)
 	if err != nil {
 		m.mu.Unlock()
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.WithValue(m.ctx, taskPathContextKey{}, path))
-	item := &task{name: path, status: "running", role: role, model: model, reasoning: reasoning, cancel: cancel, history: append([]provider.Message(nil), history...), done: make(chan struct{})}
-	item.run = subRunner.Start(ctx, agent.Input{Prompt: prompt, History: item.history, Instructions: roleInstructions(role, reasoning)})
+	m.nextSequence++
+	item := &task{
+		name: path, status: "running", role: boundTaskField(role, 4*1024), model: boundTaskField(model, 512), reasoning: boundTaskField(reasoning, 64),
+		ctx: ctx, cancel: cancel, history: boundedTaskHistory(history), done: make(chan struct{}), sequence: m.nextSequence,
+	}
+	item.run = subRunner.Start(ctx, agent.Input{Prompt: prompt, History: item.history, Instructions: roleInstructions(item.role, item.reasoning)})
 	m.tasks[path] = item
 	m.mu.Unlock()
 	_ = subRunner.NotifyHook(ctx, agent.HookSubagentStart, agent.HookInput{Prompt: path})
@@ -173,16 +351,24 @@ func (m *Manager) consume(subRunner *agent.Runner, item *task) {
 		m.mu.Lock()
 		switch event.Type {
 		case agent.EventTextDelta:
-			item.output.WriteString(event.Delta)
+			item.output = appendTaskOutput(item.output, event.Delta)
 		case agent.EventToolStarted:
-			item.output.WriteString("\n[tool] " + event.Summary + "\n")
+			name := "unknown"
+			if event.Call != nil {
+				name = event.Call.Name
+			}
+			item.output = appendTaskOutput(item.output, "\n[tool] "+name+"\n")
 		case agent.EventApprovalRequired:
 			event.Approval.Decide(false)
 		case agent.EventCompleted:
-			item.history = event.History
-			item.status = "completed"
+			item.history = boundedTaskHistory(event.History)
+			if item.interrupted || item.ctx.Err() != nil {
+				item.status = "interrupted"
+			} else {
+				item.status = "completed"
+			}
 		case agent.EventError:
-			item.err = event.Err
+			item.err = errors.New(boundTaskField(event.Err.Error(), 64*1024))
 			if errors.Is(event.Err, context.Canceled) {
 				item.status = "interrupted"
 			} else {
@@ -193,7 +379,11 @@ func (m *Manager) consume(subRunner *agent.Runner, item *task) {
 	}
 	m.mu.Lock()
 	if item.status == "running" {
-		item.status = "completed"
+		if item.interrupted || item.ctx.Err() != nil {
+			item.status = "interrupted"
+		} else {
+			item.status = "completed"
+		}
 	}
 	close(item.done)
 	m.mu.Unlock()
@@ -206,7 +396,7 @@ func (m *Manager) snapshot(name string) (map[string]any, error) {
 	if item == nil {
 		return nil, errors.New("agent not found")
 	}
-	value := map[string]any{"name": item.name, "status": item.status, "role": item.role, "model": item.model, "reasoning_effort": item.reasoning, "output": item.output.String()}
+	value := map[string]any{"name": item.name, "status": item.status, "role": item.role, "model": item.model, "reasoning_effort": item.reasoning, "output": item.output}
 	if item.err != nil {
 		value["error"] = item.err.Error()
 	}
@@ -327,6 +517,7 @@ func (t *interruptTool) Execute(_ context.Context, args string) (tool.Result, er
 		t.m.mu.Unlock()
 		return tool.Result{}, errors.New("agent is not running")
 	}
+	item.interrupted = true
 	item.cancel()
 	t.m.mu.Unlock()
 	return jsonResult(map[string]any{"target": input.Target, "interrupted": true}), nil
@@ -335,7 +526,7 @@ func (t *interruptTool) Execute(_ context.Context, args string) (tool.Result, er
 type listTool struct{ m *Manager }
 
 func (*listTool) Definition() provider.ToolDefinition {
-	return def("list_agents", "List all sub-agent tasks and statuses.", `{"type":"object","additionalProperties":false}`)
+	return def("list_agents", "List all sub-agent tasks and statuses.", `{"type":"object","properties":{},"additionalProperties":false}`)
 }
 func (*listTool) Risk(string) tool.Risk { return tool.RiskRead }
 func (*listTool) Summary(string) string { return "list sub-agents" }
@@ -450,4 +641,121 @@ func validPath(value string) bool {
 		}
 	}
 	return true
+}
+
+func (m *Manager) pruneOldestLocked() bool {
+	var oldest *task
+	for _, item := range m.tasks {
+		if item.status == "running" || oldest != nil && oldest.sequence <= item.sequence {
+			continue
+		}
+		oldest = item
+	}
+	if oldest == nil {
+		return false
+	}
+	delete(m.tasks, oldest.name)
+	return true
+}
+
+func boundedTaskHistory(history []provider.Message) []provider.Message {
+	copyOfHistory := make([]provider.Message, len(history))
+	for index, message := range history {
+		copyOfHistory[index] = message
+		copyOfHistory[index].Content = boundTaskField(message.Content, 256*1024)
+		copyOfHistory[index].ToolCalls = append([]provider.ToolCall(nil), message.ToolCalls...)
+		for callIndex := range copyOfHistory[index].ToolCalls {
+			copyOfHistory[index].ToolCalls[callIndex].Arguments = boundTaskField(copyOfHistory[index].ToolCalls[callIndex].Arguments, 128*1024)
+		}
+		copyOfHistory[index].Images = make([]provider.Image, 0, len(message.Images))
+		for _, image := range message.Images {
+			if len(image.Data) > maxTaskImageBytes {
+				copyOfHistory[index].Content = strings.TrimSpace(copyOfHistory[index].Content + "\n[large sub-agent image omitted from persisted history]")
+				if image.Ref == "" {
+					continue
+				}
+				image.Data = ""
+			}
+			copyOfHistory[index].Images = append(copyOfHistory[index].Images, image)
+		}
+	}
+	if agent.EstimateMessagesTokens(copyOfHistory) <= maxTaskHistoryTokens {
+		if encoded, _ := json.Marshal(copyOfHistory); len(encoded) <= maxTaskHistoryBytes {
+			return copyOfHistory
+		}
+	}
+	compacted, _ := agent.CompactHistory(copyOfHistory, maxTaskHistoryTokens)
+	if encoded, _ := json.Marshal(compacted); len(encoded) <= maxTaskHistoryBytes && agent.EstimateMessagesTokens(compacted) <= maxTaskHistoryTokens {
+		return compacted
+	}
+	budget := maxTaskHistoryBytes * 3 / 4
+	tokenBudget := maxTaskHistoryTokens * 3 / 4
+	start, used, usedTokens := len(compacted), 0, 0
+	for index := len(compacted) - 1; index >= 0; index-- {
+		encoded, _ := json.Marshal(compacted[index])
+		messageTokens := agent.EstimateMessagesTokens(compacted[index : index+1])
+		if used+len(encoded) > budget || usedTokens+messageTokens > tokenBudget {
+			break
+		}
+		used += len(encoded)
+		usedTokens += messageTokens
+		if compacted[index].Role == provider.MessageRoleUser && compacted[index].ToolCallID == "" {
+			start = index
+		}
+	}
+	marker := provider.Message{Role: provider.MessageRoleUser, Content: "[Earlier sub-agent history omitted to keep persisted state bounded.]"}
+	if start >= len(compacted) {
+		return []provider.Message{marker}
+	}
+	result := make([]provider.Message, 0, 1+len(compacted)-start)
+	result = append(result, marker)
+	return append(result, compacted[start:]...)
+}
+
+func appendTaskOutput(current, addition string) string {
+	if len(current)+len(addition) <= maxTaskOutputBytes {
+		return current + addition
+	}
+	if len(addition) >= maxTaskOutputBytes {
+		return boundTaskOutput(addition)
+	}
+	const marker = "[earlier sub-agent output truncated]\n"
+	keep := maxTaskOutputBytes - len(marker) - len(addition)
+	start := len(current) - keep
+	if start < 0 {
+		start = 0
+	}
+	for start < len(current) && current[start]&0xc0 == 0x80 {
+		start++
+	}
+	return marker + current[start:] + addition
+}
+
+func boundTaskOutput(value string) string {
+	const marker = "[earlier sub-agent output truncated]\n"
+	if len(value) <= maxTaskOutputBytes {
+		return value
+	}
+	start := len(value) - (maxTaskOutputBytes - len(marker))
+	for start < len(value) && value[start]&0xc0 == 0x80 {
+		start++
+	}
+	return marker + value[start:]
+}
+
+func boundTaskField(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	const marker = "\n[field truncated]\n"
+	head := (limit - len(marker)) * 3 / 4
+	tail := limit - len(marker) - head
+	for head > 0 && value[head]&0xc0 == 0x80 {
+		head--
+	}
+	start := len(value) - tail
+	for start < len(value) && value[start]&0xc0 == 0x80 {
+		start++
+	}
+	return value[:head] + marker + value[start:]
 }

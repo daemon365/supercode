@@ -54,7 +54,18 @@ func executeAgent(
 ) ([]provider.Message, error) {
 	events := runner.Run(ctx, agent.Input{Prompt: prompt, History: history, Instructions: instructions, Images: images})
 	wroteText := false
+	var partialAssistant strings.Builder
 	var completedHistory []provider.Message
+	partialHistory := func() []provider.Message {
+		partial := append([]provider.Message(nil), history...)
+		if strings.TrimSpace(prompt) != "" {
+			partial = append(partial, provider.Message{Role: provider.MessageRoleUser, Content: prompt, Images: append([]provider.Image(nil), images...)})
+		}
+		if partialAssistant.Len() > 0 {
+			partial = append(partial, provider.Message{Role: provider.MessageRoleAssistant, Content: partialAssistant.String()})
+		}
+		return partial
+	}
 	for event := range events {
 		if jsonOutput {
 			if err := writeAgentJSONEvent(stdout, event); err != nil {
@@ -63,6 +74,7 @@ func executeAgent(
 		}
 		switch event.Type {
 		case agent.EventTextDelta:
+			partialAssistant.WriteString(event.Delta)
 			if jsonOutput {
 				break
 			}
@@ -99,14 +111,17 @@ func executeAgent(
 			if wroteText && !jsonOutput {
 				_, _ = fmt.Fprintln(stdout)
 			}
-			return nil, event.Err
+			return partialHistory(), event.Err
 		}
 	}
 	if wroteText && !jsonOutput {
 		_, _ = fmt.Fprintln(stdout)
 	}
 	if completedHistory == nil {
-		return nil, errors.New("agent ended without a completed response")
+		if err := ctx.Err(); err != nil {
+			return partialHistory(), err
+		}
+		return partialHistory(), errors.New("agent ended without a completed response")
 	}
 	return completedHistory, nil
 }
@@ -341,6 +356,13 @@ func isTerminal(reader io.Reader) bool {
 
 func readPrompt(args []string, stdin io.Reader) (string, error) {
 	if len(args) > 0 {
+		size := len(args) - 1
+		for _, argument := range args {
+			size += len(argument)
+			if size > maxPromptBytes {
+				return "", fmt.Errorf("prompt exceeds the %d-byte limit", maxPromptBytes)
+			}
+		}
 		prompt := strings.TrimSpace(strings.Join(args, " "))
 		if prompt == "" {
 			return "", provider.ErrEmptyPrompt
@@ -348,9 +370,12 @@ func readPrompt(args []string, stdin io.Reader) (string, error) {
 		return prompt, nil
 	}
 
-	content, err := io.ReadAll(stdin)
+	content, err := io.ReadAll(io.LimitReader(stdin, maxPromptBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read prompt from stdin: %w", err)
+	}
+	if len(content) > maxPromptBytes {
+		return "", fmt.Errorf("prompt exceeds the %d-byte limit", maxPromptBytes)
 	}
 	prompt := strings.TrimSpace(string(content))
 	if prompt == "" {

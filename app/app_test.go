@@ -14,10 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daemon365/supercode/internal/agent"
 	"github.com/daemon365/supercode/internal/config"
 	"github.com/daemon365/supercode/internal/modelcatalog"
 	"github.com/daemon365/supercode/internal/provider"
 	openaiProvider "github.com/daemon365/supercode/internal/provider/openai"
+	"github.com/daemon365/supercode/internal/tool"
 )
 
 type fakeProvider struct {
@@ -29,8 +31,11 @@ func (fakeProvider) Generate(context.Context, provider.Request) (provider.Respon
 	return provider.Response{}, errors.New("unexpected Generate call")
 }
 
-func (fake *fakeProvider) Stream(_ context.Context, request provider.Request) (provider.Stream, error) {
+func (fake *fakeProvider) Stream(ctx context.Context, request provider.Request) (provider.Stream, error) {
 	fake.requests = append(fake.requests, request)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(fake.streams) == 0 {
 		return nil, errors.New("no fake stream available")
 	}
@@ -42,6 +47,7 @@ func (fake *fakeProvider) Stream(_ context.Context, request provider.Request) (p
 type fakeStream struct {
 	events  []provider.StreamEvent
 	current int
+	err     error
 }
 
 func (stream *fakeStream) Next() bool {
@@ -56,8 +62,45 @@ func (stream *fakeStream) Current() provider.StreamEvent {
 	return stream.events[stream.current-1]
 }
 
-func (*fakeStream) Err() error   { return nil }
-func (*fakeStream) Close() error { return nil }
+func (stream *fakeStream) Err() error { return stream.err }
+func (*fakeStream) Close() error      { return nil }
+
+func TestExecuteAgentReturnsInterruptedPromptAndPartialAssistant(t *testing.T) {
+	sentinel := context.Canceled
+	model := &fakeProvider{streams: []provider.Stream{&fakeStream{
+		events: []provider.StreamEvent{{Type: provider.StreamEventTextDelta, Delta: "partial answer"}},
+		err:    sentinel,
+	}}}
+	registry, _ := tool.NewRegistry()
+	runner, err := agent.New(model, registry, agent.Options{Model: "test", Stream: true, Approval: agent.ApprovalNever})
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := executeAgent(context.Background(), runner, "remember this prompt", nil, "", nil, false, io.Discard, io.Discard)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("execute error = %v", err)
+	}
+	if len(history) != 2 || history[0].Role != provider.MessageRoleUser || history[0].Content != "remember this prompt" || history[1].Role != provider.MessageRoleAssistant || history[1].Content != "partial answer" {
+		t.Fatalf("interrupted history = %#v", history)
+	}
+}
+
+func TestExecuteAgentKeepsPromptWhenCanceledTerminalEventIsDropped(t *testing.T) {
+	registry, _ := tool.NewRegistry()
+	for iteration := 0; iteration < 50; iteration++ {
+		model := &fakeProvider{}
+		runner, err := agent.New(model, registry, agent.Options{Model: "test", Stream: true, Approval: agent.ApprovalNever})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		history, err := executeAgent(ctx, runner, "canceled prompt", nil, "", nil, false, io.Discard, io.Discard)
+		if !errors.Is(err, context.Canceled) || len(history) != 1 || history[0].Role != provider.MessageRoleUser || history[0].Content != "canceled prompt" {
+			t.Fatalf("iteration %d history=%#v err=%v", iteration, history, err)
+		}
+	}
+}
 
 func TestReadPrompt(t *testing.T) {
 	tests := []struct {
@@ -87,6 +130,36 @@ func TestReadPromptRejectsEmptyInput(t *testing.T) {
 	_, err := readPrompt(nil, strings.NewReader(" \n"))
 	if err == nil {
 		t.Fatal("readPrompt() error = nil, want an error")
+	}
+}
+
+func TestReadPromptRejectsOversizedInput(t *testing.T) {
+	oversized := strings.Repeat("x", maxPromptBytes+1)
+	for name, run := range map[string]func() error{
+		"arguments": func() error {
+			_, err := readPrompt([]string{oversized}, strings.NewReader(""))
+			return err
+		},
+		"stdin": func() error {
+			_, err := readPrompt(nil, strings.NewReader(oversized))
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := run(); err == nil || !strings.Contains(err.Error(), "byte limit") {
+				t.Fatalf("readPrompt() error = %v, want byte limit error", err)
+			}
+		})
+	}
+}
+
+func TestResolveOutputSchemaRejectsOversizedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schema.json")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{' '}, maxOutputSchemaBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := resolveOutputSchema(path, "instructions"); err == nil || !strings.Contains(err.Error(), "byte limit") {
+		t.Fatalf("resolveOutputSchema() error = %v, want byte limit error", err)
 	}
 }
 
@@ -201,6 +274,31 @@ func TestParseOptionsPrecedence(t *testing.T) {
 	}
 }
 
+func TestParseOptionsQualifiesConfiguredProviderModels(t *testing.T) {
+	configuration := config.File{Providers: []config.ProviderConfig{
+		{Name: "copilot", Provider: "openai_responses", Models: []string{"gpt-4"}},
+		{Name: "openai", Provider: "openai", Models: []string{"gpt-4o"}},
+	}}
+	parsed, _, err := parseOptionsWithConfig([]string{"--model", "gpt-4o", "hello"}, io.Discard, func(string) (string, bool) { return "", false }, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.modelName != "openai/gpt-4o" || len(parsed.modelInfos) != 2 {
+		t.Fatalf("model = %q, infos = %#v", parsed.modelName, parsed.modelInfos)
+	}
+}
+
+func TestParseOptionsRejectsAmbiguousProviderModel(t *testing.T) {
+	configuration := config.File{Providers: []config.ProviderConfig{
+		{Name: "one", Provider: "openai", Models: []string{"shared"}},
+		{Name: "two", Provider: "openai_responses", Models: []string{"shared"}},
+	}}
+	_, _, err := parseOptionsWithConfig([]string{"--model", "shared", "hello"}, io.Discard, func(string) (string, bool) { return "", false }, configuration)
+	if err == nil || !strings.Contains(err.Error(), "multiple providers") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestEnvOrDefault(t *testing.T) {
 	lookupEnv := func(name string) (string, bool) {
 		if name == "SET" {
@@ -247,6 +345,32 @@ func TestResolveAPIKeyBoundsCommandOutput(t *testing.T) {
 	}
 	if len(err.Error()) > 5*1024 {
 		t.Fatalf("error was not bounded: %d bytes", len(err.Error()))
+	}
+}
+
+func TestResolveProviderAPIKeyUsesProviderToken(t *testing.T) {
+	got, err := resolveProviderAPIKey(context.Background(), config.ProviderConfig{
+		Name: "copilot", Provider: "openai_responses", Token: "provider-key",
+	}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("resolveProviderAPIKey() error = %v", err)
+	}
+	if got != "provider-key" {
+		t.Fatalf("resolveProviderAPIKey() = %q, want provider key", got)
+	}
+}
+
+func TestResolveProviderAPIKeyExpandsConfiguredEnvironment(t *testing.T) {
+	got, err := resolveProviderAPIKey(context.Background(), config.ProviderConfig{
+		Name: "anthropic", Provider: "anthropic", Token: "${CUSTOM_ANTHROPIC_KEY}",
+	}, func(name string) (string, bool) {
+		return map[string]string{"CUSTOM_ANTHROPIC_KEY": "custom-key"}[name], name == "CUSTOM_ANTHROPIC_KEY"
+	})
+	if err != nil {
+		t.Fatalf("resolveProviderAPIKey() error = %v", err)
+	}
+	if got != "custom-key" {
+		t.Fatalf("resolveProviderAPIKey() = %q, want configured environment key", got)
 	}
 }
 
@@ -466,6 +590,19 @@ func TestRunChatContinuesConversationWithHistory(t *testing.T) {
 	}
 	if modelProvider.requests[1].History[1].Role != provider.MessageRoleAssistant || modelProvider.requests[1].History[1].Content != "first answer" {
 		t.Fatalf("second history message = %+v", modelProvider.requests[1].History[1])
+	}
+}
+
+func TestInitialImagesHaveAggregateCountAndByteLimits(t *testing.T) {
+	images := []provider.Image{{Data: "AAAA"}, {Data: "AAAA"}}
+	if err := validateInitialImages(images, 1, 100); err == nil || !strings.Contains(err.Error(), "image limit") {
+		t.Fatalf("count error = %v", err)
+	}
+	if err := validateInitialImages(images, 2, 5); err == nil || !strings.Contains(err.Error(), "aggregate") {
+		t.Fatalf("byte error = %v", err)
+	}
+	if err := validateInitialImages(images, 2, 6); err != nil {
+		t.Fatalf("valid image batch error = %v", err)
 	}
 }
 

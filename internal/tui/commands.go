@@ -14,7 +14,7 @@ type slashCommand struct {
 
 var slashCommands = []slashCommand{
 	{name: "/help", description: "Show command help", group: "General"},
-	{name: "/exit", description: "Exit SuperCode", group: "General"},
+	{name: "/exit", description: "Save the session and memory, then exit", group: "General"},
 	{name: "/editor", description: "Edit the current draft in $VISUAL or $EDITOR", group: "General"},
 	{name: "/new", description: "Start a new session", group: "Session"},
 	{name: "/clear", description: "Clear the viewport, keep context", group: "Session"},

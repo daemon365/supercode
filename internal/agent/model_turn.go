@@ -19,20 +19,79 @@ func (r *Runner) modelTurn(ctx context.Context, request provider.Request, events
 		if strings.TrimSpace(model) == "" {
 			continue
 		}
-		request.Model = strings.TrimSpace(model)
-		if capabilities, ok := r.options.ModelCatalog.Resolve(request.Model); ok {
-			request.ParallelToolCalls = capabilities.ParallelToolCalls
+		candidate, err := r.requestForModel(request, strings.TrimSpace(model))
+		if err != nil {
+			failures = append(failures, fmt.Errorf("model %s: %w", strings.TrimSpace(model), err))
+			continue
 		}
-		response, emitted, err := r.modelTurnAttempt(ctx, request, events)
+		response, emitted, err := r.modelTurnAttempt(ctx, candidate, events)
 		if err == nil {
 			return response, nil
 		}
-		failures = append(failures, fmt.Errorf("model %s: %w", request.Model, err))
+		failures = append(failures, fmt.Errorf("model %s: %w", candidate.Model, err))
 		if emitted || ctx.Err() != nil {
 			break
 		}
 	}
 	return provider.Response{}, errors.Join(failures...)
+}
+
+func (r *Runner) requestForModel(base provider.Request, model string) (provider.Request, error) {
+	request := base
+	request.Model = model
+	if r.options.ModelCatalog == nil {
+		return request, nil
+	}
+	capabilities, known := r.options.ModelCatalog.Resolve(model)
+	if !known {
+		request.ParallelToolCalls = nil
+		return request, nil
+	}
+	if err := r.options.ModelCatalog.Validate(model, request.ReasoningEffort, request.ServiceTier); err != nil {
+		return provider.Request{}, err
+	}
+	if requestHasImages(request) && len(capabilities.InputModalities) > 0 && !capabilities.Supports("image") {
+		return provider.Request{}, errors.New("model does not advertise image input support")
+	}
+	if capabilities.ToolCalling != nil && !*capabilities.ToolCalling {
+		if historyUsesTools(request.History) {
+			return provider.Request{}, errors.New("model does not support the tool-call history already in this turn")
+		}
+		request.Tools = nil
+		request.ParallelToolCalls = nil
+	} else {
+		request.ParallelToolCalls = capabilities.ParallelToolCalls
+	}
+	_, _, usable := r.options.ModelCatalog.Limits(model, r.options.ContextWindowTokens)
+	requestTokens := EstimateMessagesTokens(request.History) + EstimateTextTokens(request.Prompt) + EstimateTextTokens(request.Instructions)
+	for _, definition := range request.Tools {
+		requestTokens += EstimateTextTokens(definition.Name) + EstimateTextTokens(definition.Description) + EstimateTextTokens(string(definition.Parameters))
+	}
+	if usable > 0 && requestTokens >= usable {
+		return provider.Request{}, fmt.Errorf("estimated request context is %d tokens, exceeding this fallback model's %d-token usable limit", requestTokens, usable)
+	}
+	return request, nil
+}
+
+func requestHasImages(request provider.Request) bool {
+	if len(request.Images) > 0 {
+		return true
+	}
+	for _, message := range request.History {
+		if len(message.Images) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func historyUsesTools(history []provider.Message) bool {
+	for _, message := range history {
+		if message.Role == provider.MessageRoleTool || len(message.ToolCalls) > 0 || message.ToolCallID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) modelTurnAttempt(ctx context.Context, request provider.Request, events chan<- Event) (provider.Response, bool, error) {
@@ -136,7 +195,9 @@ func emit(ctx context.Context, events chan<- Event, event Event) bool {
 
 func (r *Runner) emit(ctx context.Context, events chan<- Event, event Event) bool {
 	if r.options.OnEvent != nil {
+		r.eventsMu.Lock()
 		r.options.OnEvent(event)
+		r.eventsMu.Unlock()
 	}
 	return emit(ctx, events, event)
 }

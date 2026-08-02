@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/daemon365/supercode/internal/prompts"
 	"github.com/daemon365/supercode/internal/provider"
@@ -50,9 +51,130 @@ func (s *Store) StartStartup(ctx context.Context, modelProvider provider.Provide
 	if s == nil || modelProvider == nil || sessions == nil || !s.Configuration().Generate {
 		return
 	}
+	startupContext, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.startupMu.Lock()
+	previousCancel := s.startupEnd
+	s.startupEnd, s.startupDone = cancel, done
+	s.startupMu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
 	go func() {
-		_, _ = s.RunStartup(ctx, modelProvider, sessions, currentSessionID, activeModel)
+		defer func() {
+			close(done)
+			s.startupMu.Lock()
+			if s.startupDone == done {
+				s.startupEnd, s.startupDone = nil, nil
+			}
+			s.startupMu.Unlock()
+		}()
+		_, _ = s.RunStartup(startupContext, modelProvider, sessions, currentSessionID, activeModel)
 	}()
+}
+
+// RunShutdown cancels and joins the background startup pass, then extracts the
+// just-committed current root session without applying the startup idle cutoff.
+// A redacted serialized-content hash provides the same idempotency guard used
+// by startup passes, without treating a metadata-only session commit as new.
+func (s *Store) RunShutdown(ctx context.Context, modelProvider provider.Provider, sessions *session.Store, currentSessionID, activeModel string) (PipelineReport, error) {
+	var report PipelineReport
+	if s == nil || modelProvider == nil || sessions == nil {
+		return report, errors.New("memory pipeline dependencies are unavailable")
+	}
+	if err := s.stopStartup(ctx); err != nil {
+		return report, err
+	}
+	s.pipelineMu.Lock()
+	defer s.pipelineMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	configuration := s.Configuration()
+	if !configuration.Generate {
+		report.ConsolidationSkipped = true
+		return report, nil
+	}
+
+	_ = s.prepareGitBaseline(ctx)
+	current, err := sessions.Load(currentSessionID)
+	if err != nil {
+		s.recordPipelineError(err)
+		return report, err
+	}
+	var extractionFailure error
+	if current.ParentID == "" && current.ArchivedAt == nil && len(current.Messages) > 0 {
+		s.mu.Lock()
+		state, stateErr := s.loadStateUnlocked()
+		s.mu.Unlock()
+		if stateErr != nil {
+			s.recordPipelineError(stateErr)
+			return report, stateErr
+		}
+		previous, exists := state.Rollouts[current.ID]
+		changed, hashErr := sessionSourceChanged(previous, exists, current)
+		if hashErr != nil {
+			s.recordPipelineError(hashErr)
+			return report, hashErr
+		}
+		if changed {
+			report.Eligible = 1
+			outcome, extractionErr := s.extractSession(ctx, modelProvider, current, configuration, activeModel)
+			switch outcome {
+			case rolloutSucceeded:
+				report.Extracted = 1
+			case rolloutNoOutput:
+				report.NoOutput = 1
+			default:
+				report.Failed = 1
+			}
+			if extractionErr != nil {
+				extractionFailure = extractionErr
+				if ctx.Err() != nil {
+					failure := errors.Join(extractionErr, ctx.Err())
+					s.recordPipelineError(failure)
+					return report, failure
+				}
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	consolidated, consolidationErr := s.consolidate(ctx, modelProvider, configuration, activeModel)
+	if failure := errors.Join(extractionFailure, consolidationErr); failure != nil {
+		s.recordPipelineError(failure)
+		return report, failure
+	}
+	report.Consolidated = consolidated
+	report.ConsolidationSkipped = !consolidated
+	s.recordPipelineSuccess()
+	return report, nil
+}
+
+func (s *Store) stopStartup(ctx context.Context) error {
+	s.startupMu.Lock()
+	cancel, done := s.startupEnd, s.startupDone
+	s.startupMu.Unlock()
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// StopStartup cancels and joins the optional background startup pipeline
+// without starting extraction for a current session.
+func (s *Store) StopStartup(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	return s.stopStartup(ctx)
 }
 
 func (s *Store) RunStartup(ctx context.Context, modelProvider provider.Provider, sessions *session.Store, currentSessionID, activeModel string) (PipelineReport, error) {
@@ -69,7 +191,7 @@ func (s *Store) RunStartup(ctx context.Context, modelProvider provider.Provider,
 	}
 
 	_ = s.prepareGitBaseline(ctx)
-	candidates, err := s.eligibleSessions(sessions, currentSessionID, configuration, time.Now().UTC())
+	candidates, err := s.eligibleSessions(ctx, sessions, currentSessionID, configuration, time.Now().UTC())
 	if err != nil {
 		s.recordPipelineError(err)
 		return report, err
@@ -100,8 +222,11 @@ func (s *Store) RunStartup(ctx context.Context, modelProvider provider.Provider,
 	return report, nil
 }
 
-func (s *Store) eligibleSessions(store *session.Store, currentID string, configuration Config, now time.Time) ([]session.Session, error) {
-	values, err := store.ListAll("", 0, false)
+func (s *Store) eligibleSessions(ctx context.Context, store *session.Store, currentID string, configuration Config, now time.Time) ([]session.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	values, _, err := store.ListMetadata("", "", 0, false)
 	if err != nil {
 		return nil, err
 	}
@@ -113,26 +238,77 @@ func (s *Store) eligibleSessions(store *session.Store, currentID string, configu
 	if err != nil {
 		return nil, err
 	}
-	var candidates []session.Session
+	var metadata []session.Metadata
 	for _, value := range values {
-		if value.ID == currentID || value.ParentID != "" || len(value.Messages) == 0 || value.ArchivedAt != nil {
+		if value.ID == currentID || value.ParentID != "" || value.MessageCount == 0 || value.ArchivedAt != nil {
 			continue
 		}
 		if value.UpdatedAt.Before(maxAge) || value.UpdatedAt.After(idleCutoff) {
 			continue
 		}
-		if previous, ok := state.Rollouts[value.ID]; ok && !previous.SourceUpdatedAt.Before(value.UpdatedAt) {
+		if previous, ok := state.Rollouts[value.ID]; ok && previous.Status != rolloutFailed && !previous.SourceUpdatedAt.Before(value.UpdatedAt) {
 			continue
+		}
+		metadata = append(metadata, value)
+	}
+	// Metadata is already ordered newest-first. Hydrate only a small bounded
+	// overscan because metadata-only commits can prove unchanged after hashing.
+	loadLimit := min(len(metadata), max(configuration.MaxRolloutsPerStartup*4, configuration.MaxRolloutsPerStartup+8))
+	candidates := make([]session.Session, 0, configuration.MaxRolloutsPerStartup)
+	observedUnchanged := make(map[string]time.Time)
+	for index := 0; index < loadLimit && len(candidates) < configuration.MaxRolloutsPerStartup; index++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		value, loadErr := store.Load(metadata[index].ID)
+		if loadErr != nil {
+			continue
+		}
+		if previous, ok := state.Rollouts[value.ID]; ok {
+			changed, hashErr := sessionSourceChanged(previous, true, value)
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			if !changed {
+				observedUnchanged[value.ID] = value.UpdatedAt
+				continue
+			}
 		}
 		candidates = append(candidates, value)
 	}
-	sort.Slice(candidates, func(left, right int) bool {
-		return candidates[left].UpdatedAt.After(candidates[right].UpdatedAt)
-	})
-	if len(candidates) > configuration.MaxRolloutsPerStartup {
-		candidates = candidates[:configuration.MaxRolloutsPerStartup]
+	if err := s.markSourceUpdatesObserved(observedUnchanged); err != nil {
+		return nil, err
 	}
 	return candidates, nil
+}
+
+// markSourceUpdatesObserved prevents metadata-only commits with an unchanged
+// content hash from occupying the bounded hydration window every startup.
+// Reloading state under the lock preserves concurrent usage-counter updates.
+func (s *Store) markSourceUpdatesObserved(values map[string]time.Time) error {
+	if len(values) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateUnlocked()
+	if err != nil {
+		return err
+	}
+	changed := false
+	for id, updatedAt := range values {
+		record, ok := state.Rollouts[id]
+		if !ok || !record.SourceUpdatedAt.Before(updatedAt) {
+			continue
+		}
+		record.SourceUpdatedAt = updatedAt
+		state.Rollouts[id] = record
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return s.saveStateUnlocked(state)
 }
 
 type filteredMessage struct {
@@ -172,16 +348,49 @@ func serializeSession(value session.Session) (string, error) {
 	return valueText, nil
 }
 
+func sessionSourceHash(value session.Session) (string, error) {
+	contents, err := serializeSession(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256([]byte(contents))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func sessionSourceChanged(previous rolloutRecord, exists bool, value session.Session) (bool, error) {
+	if !exists {
+		return true, nil
+	}
+	// Failed extraction is an observation, not a successful checkpoint. Retry
+	// unchanged content on the next bounded pipeline run so transient provider
+	// and timeout failures cannot permanently suppress memory generation.
+	if previous.Status == rolloutFailed {
+		return true, nil
+	}
+	hash, err := sessionSourceHash(value)
+	if err != nil {
+		return false, err
+	}
+	if previous.SourceHash != "" {
+		return previous.SourceHash != hash, nil
+	}
+	// Legacy records used only timestamps. Keep that behavior until the source
+	// is committed again; the resulting pass records a content hash once.
+	return previous.SourceUpdatedAt.Before(value.UpdatedAt), nil
+}
+
 func (s *Store) extractSession(ctx context.Context, modelProvider provider.Provider, value session.Session, configuration Config, activeModel string) (string, error) {
 	contents, err := serializeSession(value)
 	if err != nil {
-		s.markExtractionFailure(value, err)
+		s.markExtractionFailure(value, "", err)
 		return rolloutFailed, err
 	}
+	digest := sha256.Sum256([]byte(contents))
+	sourceHash := hex.EncodeToString(digest[:])
 	model := defaultString(strings.TrimSpace(configuration.ExtractModel), activeModel)
 	if model == "" {
 		err := errors.New("memory extraction model is unavailable")
-		s.markExtractionFailure(value, err)
+		s.markExtractionFailure(value, sourceHash, err)
 		return rolloutFailed, err
 	}
 	requestContext, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -191,12 +400,12 @@ func (s *Store) extractSession(ctx context.Context, modelProvider provider.Provi
 		Prompt: extractionInput(value.ID, value.Workspace, contents), ReasoningEffort: "low",
 	})
 	if err != nil {
-		s.markExtractionFailure(value, err)
+		s.markExtractionFailure(value, sourceHash, err)
 		return rolloutFailed, err
 	}
 	var output extractionOutput
 	if err := decodeModelJSON(response.Text, &output); err != nil {
-		s.markExtractionFailure(value, err)
+		s.markExtractionFailure(value, sourceHash, err)
 		return rolloutFailed, err
 	}
 	output.RawMemory = redactSecrets(output.RawMemory)
@@ -206,13 +415,13 @@ func (s *Store) extractSession(ctx context.Context, modelProvider provider.Provi
 		slug = slugify(redactSecrets(*output.RolloutSlug))
 	}
 	if output.RawMemory == "" || output.RolloutSummary == "" {
-		if err := s.markNoExtractionOutput(value); err != nil {
+		if err := s.markNoExtractionOutput(value, sourceHash); err != nil {
 			return rolloutFailed, err
 		}
 		return rolloutNoOutput, nil
 	}
-	if err := s.persistExtraction(value, output.RawMemory, output.RolloutSummary, slug); err != nil {
-		s.markExtractionFailure(value, err)
+	if err := s.persistExtraction(value, sourceHash, output.RawMemory, output.RolloutSummary, slug); err != nil {
+		s.markExtractionFailure(value, sourceHash, err)
 		return rolloutFailed, err
 	}
 	return rolloutSucceeded, nil
@@ -235,7 +444,7 @@ func decodeModelJSON(value string, destination any) error {
 	return nil
 }
 
-func (s *Store) persistExtraction(source session.Session, rawMemory, rolloutSummary, slug string) error {
+func (s *Store) persistExtraction(source session.Session, sourceHash, rawMemory, rolloutSummary, slug string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, err := s.loadStateUnlocked()
@@ -251,6 +460,7 @@ func (s *Store) persistExtraction(source session.Session, rawMemory, rolloutSumm
 	}
 	record.SessionID = source.ID
 	record.SourceUpdatedAt = source.UpdatedAt
+	record.SourceHash = sourceHash
 	record.GeneratedAt = time.Now().UTC()
 	record.Slug = slug
 	record.RawPath = filepath.ToSlash(filepath.Join("raw", record.RolloutID+".md"))
@@ -269,7 +479,7 @@ func (s *Store) persistExtraction(source session.Session, rawMemory, rolloutSumm
 	return s.saveStateUnlocked(state)
 }
 
-func (s *Store) markNoExtractionOutput(source session.Session) error {
+func (s *Store) markNoExtractionOutput(source session.Session, sourceHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, err := s.loadStateUnlocked()
@@ -279,6 +489,7 @@ func (s *Store) markNoExtractionOutput(source session.Session) error {
 	record := state.Rollouts[source.ID]
 	record.SessionID = source.ID
 	record.SourceUpdatedAt = source.UpdatedAt
+	record.SourceHash = sourceHash
 	record.GeneratedAt = time.Now().UTC()
 	record.Status = rolloutNoOutput
 	record.LastError = ""
@@ -286,7 +497,7 @@ func (s *Store) markNoExtractionOutput(source session.Session) error {
 	return s.saveStateUnlocked(state)
 }
 
-func (s *Store) markExtractionFailure(source session.Session, failure error) {
+func (s *Store) markExtractionFailure(source session.Session, sourceHash string, failure error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, err := s.loadStateUnlocked()
@@ -296,6 +507,7 @@ func (s *Store) markExtractionFailure(source session.Session, failure error) {
 	record := state.Rollouts[source.ID]
 	record.SessionID = source.ID
 	record.SourceUpdatedAt = source.UpdatedAt
+	record.SourceHash = sourceHash
 	record.GeneratedAt = time.Now().UTC()
 	record.Status = rolloutFailed
 	record.LastError = redactSecrets(failure.Error())
@@ -304,9 +516,7 @@ func (s *Store) markExtractionFailure(source session.Session, failure error) {
 }
 
 type selectedMemory struct {
-	record  rolloutRecord
-	raw     string
-	summary string
+	raw string
 }
 
 func (s *Store) selectMemories(configuration Config, now time.Time) ([]selectedMemory, stateData, error) {
@@ -351,16 +561,29 @@ func (s *Store) selectMemories(configuration Config, now time.Time) ([]selectedM
 		records = records[:configuration.MaxRawMemoriesForConsolidation]
 	}
 	selected := make([]selectedMemory, 0, len(records))
+	remaining := maximumSelectedRawBytes
 	for _, record := range records {
+		if remaining <= 0 {
+			break
+		}
 		raw, err := readBoundedFile(filepath.Join(s.root, filepath.FromSlash(record.RawPath)), maximumArtifactBytes)
 		if err != nil {
 			continue
 		}
-		summary, err := readBoundedFile(filepath.Join(s.root, filepath.FromSlash(record.SummaryPath)), maximumArtifactBytes)
-		if err != nil {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
 			continue
 		}
-		selected = append(selected, selectedMemory{record: record, raw: raw, summary: summary})
+		separatorBytes := len("\n\n---\n\n\n")
+		allowance := remaining - separatorBytes
+		if allowance <= 0 {
+			break
+		}
+		if len(raw) > allowance {
+			raw = boundedMemoryPrefix(raw, allowance)
+		}
+		selected = append(selected, selectedMemory{raw: raw})
+		remaining -= separatorBytes + len(raw)
 	}
 	return selected, state, nil
 }
@@ -480,6 +703,28 @@ func (s *Store) consolidate(ctx context.Context, modelProvider provider.Provider
 	}
 	_ = s.commitGitBaseline(ctx)
 	return true, nil
+}
+
+func boundedMemoryPrefix(value string, maximum int) string {
+	if maximum <= 0 {
+		return ""
+	}
+	if len(value) <= maximum {
+		return value
+	}
+	marker := "\n[raw memory truncated to consolidation budget]\n"
+	if maximum <= len(marker) {
+		end := maximum
+		for end > 0 && !utf8.RuneStart(value[end]) {
+			end--
+		}
+		return value[:end]
+	}
+	end := maximum - len(marker)
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end] + marker
 }
 
 func (s *Store) readAdHocNotes() (string, map[string]string, error) {

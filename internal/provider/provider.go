@@ -130,3 +130,18 @@ type Provider interface {
 	Generate(ctx context.Context, request Request) (Response, error)
 	Stream(ctx context.Context, request Request) (Stream, error)
 }
+
+// ModelInfo identifies one configured model without exposing adapter-specific
+// types. Selector is the stable value used by sessions and requests; ID is the
+// model name sent to the remote provider.
+type ModelInfo struct {
+	Selector string
+	ID       string
+	Provider string
+}
+
+// ModelResolver canonicalizes user-facing model IDs when a provider routes
+// across multiple named endpoints.
+type ModelResolver interface {
+	ResolveModel(string) (ModelInfo, error)
+}
