@@ -667,6 +667,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 		m.input, command = m.input.Update(msg)
 		m.resize(m.width, m.height)
 		return m, command
+	case tea.MouseWheelMsg:
+		// Full-screen mode enables explicit wheel reporting. Route wheel events
+		// only to the transcript so a focused multiline composer never consumes
+		// them or mistakes them for input-history cursor keys.
+		var command tea.Cmd
+		m.viewport, command = m.viewport.Update(msg)
+		return m, command
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "ctrl+q" {
 			return m.beginExit()
@@ -878,8 +885,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) { //nolint:gocyclo
 	beforeInput := m.input.Value()
 	var commands []tea.Cmd
 	var command tea.Cmd
-	// Mouse reporting remains disabled. In alternate-screen mode the terminal's
-	// alternate-scroll mode translates wheel events into the keys handled above.
+	// In inline mode mouse reporting remains disabled and the terminal owns its
+	// native scrollback. Full-screen wheel events return through the explicit
+	// MouseWheelMsg branch above instead of reaching the composer.
 	if _, isKey := msg.(tea.KeyPressMsg); !isKey {
 		m.viewport, command = m.viewport.Update(msg)
 		commands = append(commands, command)
@@ -1011,11 +1019,13 @@ func (m model) View() tea.View {
 	parts = append(parts, inputPanel, footer)
 	view := tea.NewView(lipgloss.JoinVertical(lipgloss.Left, parts...))
 	title := defaultString(m.options.TerminalTitle, "SuperCode")
-	// Never enable mouse reporting: terminals otherwise send drag events to the
-	// application and ordinary text selection/copy stops working. Alternate
-	// screen still keeps the TUI isolated from the shell page; PgUp/PgDn provide
-	// deterministic in-app navigation.
 	view.AltScreen, view.MouseMode, view.WindowTitle = m.options.AlternateScreen, tea.MouseModeNone, title
+	if m.options.AlternateScreen {
+		// Cell-motion mode captures clicks/releases/wheel without the continuous
+		// pointer-motion traffic of all-motion mode. It prevents terminals from
+		// translating the wheel into Up/Down keys for the focused textarea.
+		view.MouseMode = tea.MouseModeCellMotion
+	}
 	return view
 }
 

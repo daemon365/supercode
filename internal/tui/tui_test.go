@@ -194,14 +194,33 @@ func TestSlashCommandMenuCompletesAndRunsHelp(t *testing.T) {
 	}
 }
 
-func TestViewAlwaysLeavesMouseSelectionToTerminal(t *testing.T) {
+func TestViewCapturesMouseWheelOnlyInFullScreen(t *testing.T) {
 	inline := newModel(context.Background(), nil, Options{Model: "gpt-test", Timeout: time.Second})
 	if view := inline.View(); view.MouseMode != tea.MouseModeNone {
 		t.Fatalf("inline mouse mode = %v, want terminal selection enabled", view.MouseMode)
 	}
 	fullScreen := newModel(context.Background(), nil, Options{Model: "gpt-test", Timeout: time.Second, AlternateScreen: true})
-	if view := fullScreen.View(); view.MouseMode != tea.MouseModeNone {
-		t.Fatalf("full-screen mouse mode = %v, want terminal selection enabled", view.MouseMode)
+	if view := fullScreen.View(); view.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("full-screen mouse mode = %v, want wheel reporting", view.MouseMode)
+	}
+}
+
+func TestMouseWheelScrollsTranscriptWithoutChangingDraft(t *testing.T) {
+	m := newModel(context.Background(), nil, Options{Model: "gpt-test", Timeout: time.Second, AlternateScreen: true})
+	m.resize(80, 12)
+	m.viewport.SetContent(strings.Repeat("line\n", 100))
+	m.viewport.GotoBottom()
+	m.input.SetValue("first line\nsecond line")
+	m.input.MoveToEnd()
+	beforeOffset, beforeDraft, beforeLine := m.viewport.YOffset(), m.input.Value(), m.input.Line()
+
+	updated, _ := m.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	m = updated.(model)
+	if m.viewport.YOffset() >= beforeOffset {
+		t.Fatalf("wheel did not scroll transcript: before=%d after=%d", beforeOffset, m.viewport.YOffset())
+	}
+	if m.input.Value() != beforeDraft || m.input.Line() != beforeLine {
+		t.Fatalf("wheel changed composer: value=%q line=%d", m.input.Value(), m.input.Line())
 	}
 }
 

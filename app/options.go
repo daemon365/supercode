@@ -208,7 +208,7 @@ func parseOptionsWithConfig(
 	reasoningEffort := flags.String("reasoning-effort", fileConfig.ReasoningEffort, "reasoning effort: low, medium, high, or xhigh")
 	serviceTier := flags.String("service-tier", fileConfig.ServiceTier, "service tier: auto, default, flex, scale, priority, or fast")
 	instructions := flags.String("instructions", instructionsDefault, "system/developer instructions")
-	baseURL := flags.String("base-url", baseURLDefault, "OpenAI API base URL")
+	baseURL := flags.String("base-url", baseURLDefault, "legacy single-endpoint OpenAI API base URL")
 	imagePaths := flags.StringSliceP("image", "i", nil, "attach an image path (repeatable)")
 	jsonOutput := flags.Bool("json", false, "emit non-interactive events as JSONL")
 	outputSchema := flags.String("output-schema", "", "validate the final response against a JSON Schema file")

@@ -17,9 +17,15 @@ go run . config init
 编辑配置：
 
 ```yaml
-url: https://api.openai.com/v1
-model: gpt-5.6
-models: [gpt-5.6]
+config_version: 1
+model: openai/gpt-5.6
+providers:
+  - name: openai
+    provider: openai_responses
+    url: https://api.openai.com/v1
+    token: ${OPENAI_API_KEY}
+    # token_command: ["secret-tool", "lookup", "service", "openai"]
+    models: [gpt-5.6]
 # model_catalog:
 #   gpt-5.6:
 #     context_window_tokens: 272000
@@ -27,8 +33,6 @@ models: [gpt-5.6]
 #     tool_calling: true
 #     parallel_tool_calls: true
 fallback_models: []
-token: ""
-# token_command: ["secret-tool", "lookup", "service", "supercode"]
 stream: true
 timeout: 10m
 max_retries: 2
@@ -53,7 +57,7 @@ alternate_screen: true
 go run . chat
 ```
 
-界面基于 Bubble Tea、Bubbles、Lip Gloss 和 Glamour 构建。默认进入备用屏幕（alternate-screen）页面，退出时恢复之前的 shell 页面。鼠标上报保持关闭，因此文本可以正常选中复制。标准终端的 alternate-scroll 模式在输入框为空时把鼠标滚轮映射到转录滚动；`PgUp`/`PgDn` 始终以确定性的方式滚动 SuperCode 对话。可以使用 `--no-alt-screen` 或 `alternate_screen: false` 改用终端原生的持久回滚。用户消息显示为灰色 `> message` 块；助手回复在流式期间以 GFM 兼容的终端 Markdown 渲染，完成后仍保持渲染结果，不带角色标签。流式增量会合并为很短的显示帧，长 Markdown 和代码回复不会再按每个 token 重绘。工具活动使用专用的工具视图：命令显示为 `Running`、`Ran` 或实时进程会话；搜索包含查询词和搜索路径/glob；编辑渲染完整、不截断的行级 `Added`/`Edited`/`Deleted`/`Moved` diff；Plan、Web、Goal、图片、会话和子智能体工具都显示有用的字段，而不是原始 JSON。
+界面基于 Bubble Tea、Bubbles、Lip Gloss 和 Glamour 构建。默认进入备用屏幕（alternate-screen）页面，退出时恢复之前的 shell 页面。全屏模式会显式接收滚轮事件，因此即使正在编辑多行草稿，鼠标滚轮也始终滚动对话内容；如果终端需要，按住 `Shift` 再拖动鼠标即可选中文本。`PgUp`/`PgDn` 也会以确定性的方式滚动 SuperCode 对话。可以使用 `--no-alt-screen` 或 `alternate_screen: false` 改用终端原生的持久回滚和普通拖动选择。用户消息显示为灰色 `> message` 块；助手回复在流式期间以 GFM 兼容的终端 Markdown 渲染，完成后仍保持渲染结果，不带角色标签。流式增量会合并为很短的显示帧，长 Markdown 和代码回复不会再按每个 token 重绘。工具活动使用专用的工具视图：命令显示为 `Running`、`Ran` 或实时进程会话；搜索包含查询词和搜索路径/glob；编辑渲染完整、不截断的行级 `Added`/`Edited`/`Deleted`/`Moved` diff；Plan、Web、Goal、图片、会话和子智能体工具都显示有用的字段，而不是原始 JSON。
 
 - `Enter`：发送消息；`Shift+Enter`、`Alt+Enter` 或 `Ctrl+J` 插入换行
 - `↑` / `↓`：优先在多行草稿内移动；到达首行或末行后，可调出最近 100 条已提交输入（包括已加载会话的提示词），回到最新位置时恢复当前草稿
@@ -91,7 +95,7 @@ go run . chat
 - `/help`：显示分组、Markdown 渲染的命令帮助
 - `/exit`、`/quit` 或 `Ctrl+C`：开始优雅退出，先停止当前轮次并保存会话；当 `memory_generate: true` 时，还会把当前会话处理进长期记忆。保存进度会留在界面上；再次按 `Ctrl+C` 可强制退出。
 
-全屏和内联模式都关闭了鼠标上报，普通拖拽选择仍然可用。当终端剪贴板行为异常时，`/copy` 和 `/raw` 是可靠的替代方案。
+只有全屏模式会启用鼠标上报，避免滚轮被终端转换为 `Up`/`Down` 键后泄漏到输入框。如有需要，可用 `Shift`+拖动进行终端文本选择，或使用 `/copy` 和 `/raw`。内联模式仍完全由终端处理鼠标与回滚。
 
 小于 1000 个字符且少于 9 行的 bracketed paste 保持在输入框中可编辑。更大的粘贴会在输入框内折叠成一行，例如 `Pasted context · 12,345 chars`；提交后对话会显示原始文本。在空输入框按 `Backspace` 或 `Delete` 删除最近的一次粘贴，用 `/detach paste-2` 按编号移除某一项，或用 `/detach all` 清空所有草稿附件。
 
@@ -230,15 +234,15 @@ hooks:
 
 ## 配置与优先级
 
-值按以下顺序解析：
+匹配的运行时标量值按以下顺序解析：
 
 ```text
 命令行标志 > 环境变量 > 可信项目配置 > 用户配置 > 内置默认值
 ```
 
-用户配置目录使用模式 `0700`，文件使用 `0600`。正常启动期间永远不会覆盖现有配置内容。项目文件 `.supercode/config.yaml` 在显式启用 `--trust-project` 之前会被忽略；`/config` 或 `--config-diagnostics` 显示活动来源。信任按规范工作区路径存储，因此符号链接不能继承另一个项目的决策。
+用户配置目录使用模式 `0700`，文件使用 `0600`。正常启动期间永远不会覆盖现有配置内容。项目文件 `.supercode/config.yaml` 在显式启用 `--trust-project` 之前会被忽略；`/config` 或 `--config-diagnostics` 显示活动来源。信任按规范工作区路径存储，因此符号链接不能继承另一个项目的决策。Provider 条目是自包含配置块；CLI `--base-url` 和顶层端点字段只适用于旧式单端点模式。
 
-对于旧式单端点配置，API 密钥优先级为 `OPENAI_API_KEY`，然后是 `token_command`，再是 YAML `token`。`token_command` 直接执行参数向量，有五秒超时，并从 stdout 读取有界 token。它可以桥接 Secret Service、macOS Keychain、密码管理器或其他系统凭据助手。YAML token 保持为本地明文；留空更安全：
+对于 Provider 条目，`token: ${NAME}` 会强制读取该环境变量。未显式指定环境变量时，凭据优先级为 Provider 默认环境变量、该条目的 `token_command`、静态 YAML `token`。对于旧式单端点配置，优先级为 `OPENAI_API_KEY`、顶层 `token_command`、顶层 `token`。`token_command` 直接执行参数向量，有五秒超时，并从 stdout 读取有界 token。它可以桥接 Secret Service、macOS Keychain、密码管理器或其他系统凭据助手。静态 YAML token 会保持为本地明文，因此环境变量或凭据命令更安全：
 
 ```bash
 export OPENAI_API_KEY="your_api_key"
@@ -248,9 +252,9 @@ export OPENAI_API_KEY="your_api_key"
 
 | 变量 | 用途 |
 | --- | --- |
-| `OPENAI_API_KEY` | API token；覆盖 YAML `token` |
-| `OPENAI_BASE_URL` | API 基础 URL |
-| `OPENAI_MODEL` | 模型 ID |
+| `OPENAI_API_KEY` | 默认 OpenAI Provider token；覆盖旧式顶层 `token` |
+| `OPENAI_BASE_URL` | 旧式单端点/CLI 基础 URL |
+| `OPENAI_MODEL` | 默认模型 ID 或已配置的 `provider/model` 选择值 |
 | `ANTHROPIC_API_KEY` | `anthropic` Provider 的默认密钥 |
 | `OPENROUTER_API_KEY` | `openrouter` Provider 的默认密钥 |
 | `SUPERCODE_STREAM` | 启用或禁用流式 |
@@ -284,7 +288,7 @@ supercode completion <shell>           生成 bash、zsh、fish 或 PowerShell �
 全局标志：
 
 ```text
---base-url string            OpenAI API 基础 URL
+--base-url string            旧式单端点 OpenAI API 基础 URL
 --approval string            工具策略：on-request、granular、always 或 never
 --chat                       启动多轮聊天；终端用 TUI，管道用行模式
 --config-diagnostics         打印配置来源和项目信任状态
@@ -298,7 +302,7 @@ supercode completion <shell>           生成 bash、zsh、fish 或 PowerShell �
 --max-retries int            模型 API 瞬时失败的 SDK 重试次数
 --max-turns int              每个任务的最大模型轮次；0 表示不限
 -i, --image path             附加图片（可重复）
--m, --model string           模型 ID
+-m, --model string           模型 ID 或 provider/model 选择值
 --reasoning-effort string    模型推理强度
 --service-tier string        提供商服务层级
 --resume string              恢复会话 ID，或 latest
@@ -313,20 +317,26 @@ supercode completion <shell>           生成 bash、zsh、fish 或 PowerShell �
 
 运行 `supercode --help` 或 `supercode <command> --help` 查看生成的帮助。为兼容性仍接受旧的单横线长标志，但新脚本应使用 POSIX `--long-flag` 语法。
 
-## 自定义端点
+## Provider 配置
 
-在 YAML 中配置 OpenAI 兼容端点：
+当前的主配置格式使用具名的 `providers` 列表。OpenAI 兼容的 Chat Completions 端点可以这样配置：
 
 ```yaml
-url: http://127.0.0.1:8000/v1
-model: your-model
-token: "your-token"
+model: local/your-model
+providers:
+  - name: local
+    provider: openai
+    url: http://127.0.0.1:8000/v1
+    token: ${LOCAL_MODEL_TOKEN}
+    models: [your-model]
 stream: true
 approval: on-request
 max_turns: 0
 ```
 
-也可以在单次调用中覆盖：
+每个模型通过 `provider-name/model-id` 定位。配置的 token 只会发送到该 Provider 的 URL，因此只连接你信任的服务。`openai` Provider 在启用流式时必须实现 OpenAI Chat Completions API 及其纯数据 SSE 格式。
+
+旧式顶层 `url`、`token` 和 `models` 字段仍受支持，便于现有单端点配置继续工作。这种模式的 URL 和模型也可以在单次调用中覆盖：
 
 ```bash
 go run . \
@@ -335,11 +345,9 @@ go run . \
   "Hello"
 ```
 
-配置的 token 会发送到这个 URL，因此只连接你信任的服务。兼容服务在启用流式时必须实现 OpenAI Chat Completions API 及其纯数据 SSE 格式。
+### Provider 类型与多端点
 
-### 多 Provider
-
-使用 `providers` 在多个 URL 和协议之间选择模型：
+添加更多条目，即可在多个 URL 和协议之间选择模型：
 
 ```yaml
 model: openai/gpt-4o
@@ -370,9 +378,9 @@ providers:
       X-OpenRouter-Title: SuperCode
 ```
 
-每个 Provider 都可以配置自己的 `url`、`token` 和可选的 `token_command`；Provider 不会继承顶层端点凭据。`openai` 使用 `/chat/completions`，`openai_responses` 使用 `/responses`，`anthropic` 使用 `/v1/messages`，`openrouter` 使用 `/chat/completions`。Anthropic 的 `url` 末尾可以有或没有 `/v1`。`token: ${NAME}` 会解析指定环境变量；省略 `token` 时，各 Provider 默认读取 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 或 `OPENROUTER_API_KEY`。
+每个 Provider 都可以配置自己的 `url`、`token` 和可选的 `token_command`；Provider 不会继承顶层旧式端点凭据。`openai` 使用 `/chat/completions`，`openai_responses` 使用 `/responses`，`anthropic` 使用 `/v1/messages`，`openrouter` 使用 `/chat/completions`。Anthropic 的 `url` 末尾可以有或没有 `/v1`。`token: ${NAME}` 会解析指定环境变量；省略 `token` 时，各 Provider 默认读取 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 或 `OPENROUTER_API_KEY`。如需使用凭据帮助程序，请省略 `token`，并在对应 Provider 条目上配置 `token_command`。
 
-稳定的模型选择值是 `provider-name/model-id`，例如 `responses/gpt-5-codex`。模型 ID 唯一时也可使用不带 Provider 的写法；同名模型必须使用完整选择值。模型选择器显示为 `gpt-5-codex [in responses]`，Provider 后缀使用弱化颜色。旧式 `url`、`token` 和 `models` 配置仍作为单个 OpenAI 兼容 Chat Completions 端点受到支持。
+稳定的模型选择值是 `provider-name/model-id`，例如 `responses/gpt-5-codex`。模型 ID 唯一时也可使用不带 Provider 的写法；同名模型必须使用完整选择值。模型选择器显示为 `gpt-5-codex [in responses]`，Provider 后缀使用弱化颜色。
 
 ## 非交互用法
 

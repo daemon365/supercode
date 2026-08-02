@@ -18,7 +18,6 @@ import (
 	"github.com/daemon365/supercode/internal/config"
 	"github.com/daemon365/supercode/internal/modelcatalog"
 	"github.com/daemon365/supercode/internal/provider"
-	openaiProvider "github.com/daemon365/supercode/internal/provider/openai"
 	"github.com/daemon365/supercode/internal/tool"
 )
 
@@ -163,7 +162,7 @@ func TestResolveOutputSchemaRejectsOversizedFile(t *testing.T) {
 	}
 }
 
-func TestRunRequiresAPIKey(t *testing.T) {
+func TestRunRequiresDefaultProviderEnvironmentToken(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	lookupEnv := func(name string) (string, bool) {
 		if name == "SUPERCODE_CONFIG" {
@@ -179,8 +178,8 @@ func TestRunRequiresAPIKey(t *testing.T) {
 		io.Discard,
 		lookupEnv,
 	)
-	if !errors.Is(err, openaiProvider.ErrMissingAPIKey) {
-		t.Fatalf("run() error = %v, want %v", err, openaiProvider.ErrMissingAPIKey)
+	if err == nil || !strings.Contains(err.Error(), "environment variable OPENAI_API_KEY is required") {
+		t.Fatalf("run() error = %v, want missing provider environment token", err)
 	}
 }
 
